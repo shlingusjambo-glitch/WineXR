@@ -33,7 +33,7 @@ int main(int argc, char **argv) {
     ci.enabledExtensionCount = 1; ci.enabledExtensionNames = ext;
     CHECK(xrCreateInstance(&ci, &inst));
     FN(xrGetSystem); FN(xrEnumerateViewConfigurationViews); FN(xrGetD3D11GraphicsRequirementsKHR); FN(xrCreateSession);
-    FN(xrBeginSession); FN(xrCreateSwapchain); FN(xrEnumerateSwapchainImages); FN(xrAcquireSwapchainImage);
+    FN(xrBeginSession); FN(xrCreateSwapchain); FN(xrDestroySwapchain); FN(xrEnumerateSwapchainImages); FN(xrAcquireSwapchainImage);
     FN(xrWaitSwapchainImage); FN(xrReleaseSwapchainImage); FN(xrWaitFrame); FN(xrBeginFrame); FN(xrEndFrame);
     FN(xrLocateViews); FN(xrCreateReferenceSpace); FN(xrPollEvent);
     XrSystemGetInfo sg = {XR_TYPE_SYSTEM_GET_INFO, NULL, XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY};
@@ -56,6 +56,9 @@ int main(int argc, char **argv) {
     uint32_t w = vcv[0].recommendedImageRectWidth, h = vcv[0].recommendedImageRectHeight;
     XrSwapchainCreateInfo sc = {XR_TYPE_SWAPCHAIN_CREATE_INFO, NULL, 0, XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 1, w * 2, h, 1, 1, 1};
     XrSwapchain swap; CHECK(xrCreateSwapchain(ses, &sc, &swap));
+    // MSAA swapchains are accepted (rendered unaliased) instead of rejected
+    XrSwapchainCreateInfo scMS = {XR_TYPE_SWAPCHAIN_CREATE_INFO, NULL, 0, XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 2, w, h, 1, 1, 1};
+    XrSwapchain swapMS; CHECK(xrCreateSwapchain(ses, &scMS, &swapMS)); CHECK(xrDestroySwapchain(swapMS));
     XrSwapchainImageD3D11KHR imgs[3] = {{XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR}, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR}, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR}};
     CHECK(xrEnumerateSwapchainImages(swap, 3, &n, (XrSwapchainImageBaseHeader *)imgs));
 
@@ -63,10 +66,12 @@ int main(int argc, char **argv) {
     VR4Shm *shm = MapViewOfFile(CreateFileMappingA(f, NULL, PAGE_READONLY, 0, VR4_SHM_SIZE, NULL), FILE_MAP_READ, 0, 0, VR4_SHM_SIZE);
     uint32_t seq0 = shm->frame_seq;
 
+    XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}; XrTime lastT = 0;
     for (int frame = 0; frame < frames; frame++) {
         XrFrameState fs = {XR_TYPE_FRAME_STATE};
         CHECK(xrWaitFrame(ses, NULL, &fs)); CHECK(xrBeginFrame(ses, NULL));
-        XrViewState vs = {XR_TYPE_VIEW_STATE}; XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+        lastT = fs.predictedDisplayTime;
+        XrViewState vs = {XR_TYPE_VIEW_STATE};
         XrViewLocateInfo vl = {XR_TYPE_VIEW_LOCATE_INFO, NULL, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, fs.predictedDisplayTime, stage};
         CHECK(xrLocateViews(ses, &vl, &vs, 2, &n, views));
         uint32_t idx; CHECK(xrAcquireSwapchainImage(swap, NULL, &idx));
@@ -93,6 +98,59 @@ int main(int argc, char **argv) {
     printf("eye %ux%u, frames %u, frame %ux%u, first px %08x, right-eye px %08x\n", w, h, shm->frame_seq - seq0,
            shm->frame_w[b], shm->frame_h[b], px[0], px[w + 5]);
     int ok = shm->frame_seq - seq0 == (uint32_t)frames && px[0] == 0xffff0000u && px[w + 5] == 0xffff0000u && shm->frame_w[b] == 2 * w;
-    printf(ok ? "PASS\n" : "FAIL\n");
-    return !ok;
+    if (!ok) { printf("FAIL projection\n"); return 1; }
+
+    // Re-submitting the same displayTime publishes nothing (duplicate-submit skip)
+    {
+        uint32_t idx; CHECK(xrAcquireSwapchainImage(swap, NULL, &idx));
+        XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, NULL, XR_INFINITE_DURATION}; CHECK(xrWaitSwapchainImage(swap, &wi));
+        CHECK(xrReleaseSwapchainImage(swap, NULL));
+        XrCompositionLayerProjectionView pv[2];
+        for (int e = 0; e < 2; e++) {
+            XrCompositionLayerProjectionView v = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW, NULL, views[e].pose, views[e].fov, {swap, {{(int32_t)(e * w), 0}, {(int32_t)w, (int32_t)h}}, 0}};
+            pv[e] = v;
+        }
+        XrCompositionLayerProjection proj = {XR_TYPE_COMPOSITION_LAYER_PROJECTION, NULL, 0, stage, 2, pv};
+        const XrCompositionLayerBaseHeader *layers[] = {(XrCompositionLayerBaseHeader *)&proj};
+        XrFrameEndInfo fe = {XR_TYPE_FRAME_END_INFO, NULL, lastT, XR_ENVIRONMENT_BLEND_MODE_OPAQUE, 1, layers};
+        uint32_t seqBefore = shm->frame_seq;
+        CHECK(xrEndFrame(ses, &fe));
+        if (shm->frame_seq != seqBefore) { printf("FAIL dedup: seq %u -> %u\n", seqBefore, shm->frame_seq); return 1; }
+        printf("dedup ok (seq stays %u)\n", seqBefore);
+    }
+
+    // Quad-only submit lands letterboxed in both eyes (quad fallback)
+    {
+        XrSwapchainCreateInfo scQ = {XR_TYPE_SWAPCHAIN_CREATE_INFO, NULL, 0, XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 1, w, h, 1, 1, 1};
+        XrSwapchain qswap; CHECK(xrCreateSwapchain(ses, &scQ, &qswap));
+        XrSwapchainImageD3D11KHR qimgs[3] = {{XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR}, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR}, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR}};
+        CHECK(xrEnumerateSwapchainImages(qswap, 3, &n, (XrSwapchainImageBaseHeader *)qimgs));
+        uint32_t seqQ = shm->frame_seq;
+        for (int attempt = 0; attempt < 10 && shm->frame_seq == seqQ; attempt++) {
+            XrFrameState fs2 = {XR_TYPE_FRAME_STATE};
+            CHECK(xrWaitFrame(ses, NULL, &fs2)); CHECK(xrBeginFrame(ses, NULL));
+            uint32_t idx; CHECK(xrAcquireSwapchainImage(qswap, NULL, &idx));
+            XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, NULL, XR_INFINITE_DURATION}; CHECK(xrWaitSwapchainImage(qswap, &wi));
+            D3D11_RENDER_TARGET_VIEW_DESC rd = {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, D3D11_RTV_DIMENSION_TEXTURE2D};
+            ID3D11RenderTargetView *rtv;
+            if (FAILED(ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)qimgs[idx].texture, &rd, &rtv))) { printf("FAIL RTV\n"); return 1; }
+            float green[4] = {0, 1, 0, 1};
+            ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, green);
+            ID3D11RenderTargetView_Release(rtv);
+            CHECK(xrReleaseSwapchainImage(qswap, NULL));
+            XrCompositionLayerQuad quad = {XR_TYPE_COMPOSITION_LAYER_QUAD, NULL, 0, stage, XR_EYE_VISIBILITY_BOTH,
+                {qswap, {{0, 0}, {w, h}}, 0}, {{0, 0, 0, 1}, {0, 0, -1}}, {1.0f, 1.0f}};
+            const XrCompositionLayerBaseHeader *layers[] = {(XrCompositionLayerBaseHeader *)&quad};
+            XrFrameEndInfo fe = {XR_TYPE_FRAME_END_INFO, NULL, fs2.predictedDisplayTime, XR_ENVIRONMENT_BLEND_MODE_OPAQUE, 1, layers};
+            CHECK(xrEndFrame(ses, &fe));
+        }
+        if (shm->frame_seq != seqQ + 1) { printf("FAIL quad: seq %u -> %u\n", seqQ, shm->frame_seq); return 1; }
+        b = shm->frame_seq % 2;
+        px = (const uint32_t *)((const uint8_t *)shm + VR4_FRAME_OFFSET + b * VR4_FRAME_MAX);
+        if (px[0] != 0xff00ff00u || px[w + 5] != 0xff00ff00u) { printf("FAIL quad pixels %08x %08x\n", px[0], px[w + 5]); return 1; }
+        printf("quad ok (green both eyes)\n");
+        CHECK(xrDestroySwapchain(qswap));
+    }
+    printf("PASS\n");
+    return 0;
 }

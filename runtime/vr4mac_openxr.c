@@ -50,6 +50,9 @@ static XrPosef pmul(XrPosef a, XrPosef b) {   // b expressed in a's frame -> a's
     V t = qrot(a.orientation, b.position);
     return (XrPosef){qmul(a.orientation, b.orientation), {a.position.x + t.x, a.position.y + t.y, a.position.z + t.z}};
 }
+static inline V vcross(V a, V b) { return (V){a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
+static inline V vadd(V a, V b) { return (V){a.x + b.x, a.y + b.y, a.z + b.z}; }
+static inline V vsub(V a, V b) { return (V){a.x - b.x, a.y - b.y, a.z - b.z}; }
 static XrPosef pinv(XrPosef a) {
     Q c = qconj(a.orientation); V t = qrot(c, a.position);
     return (XrPosef){c, {-t.x, -t.y, -t.z}};
@@ -86,7 +89,9 @@ typedef struct {
     ID3D11Device *dev; ID3D11DeviceContext *ctx; int running, focused, exitRequested;
     ID3D11Texture2D *staging[NSTAGE][2]; DXGI_FORMAT stagingFmt; uint32_t stagingW, stagingH; uint64_t stagingCounter;
     uint64_t stagingReady[NSTAGE]; VR4Pose stagingPose[NSTAGE][2]; uint64_t stagingDisplayTime[NSTAGE]; // stagingReady: submit order, 0 = free
-    XrPosef localOrigin; XrPath profile;
+    XrPosef localOrigin; V localOriginRaw; XrPath profile;
+    uint64_t lastPublished;   // displayTime of the last actually-published frame (duplicate-submit skip)
+    ID3D11Texture2D *fallback; uint32_t fbW, fbH;   // quad-layer fallback staging
 } Session;
 
 
@@ -118,12 +123,13 @@ static const VR4Tracking *frame_for(XrTime t) {
     for (int i = 0; i < 4; i++) if (frameRing[i].time_ns == (uint64_t)t && t) return &frameRing[i];
     return &frameTrack;
 }
+static void update_velocities(const VR4Tracking *t);
 static int read_tracking(void) {   // seqlock read of the Mac app's latest tracking sample
     for (int tries = 0; tries < 100; tries++) {
         uint32_t s1 = shm->track_seq; vr4_fence();
         if (s1 & 1) continue;
         VR4Tracking t = shm->track; vr4_fence();
-        if (shm->track_seq == s1) { int fresh = s1 != lastSeq; track = t; lastSeq = s1; return fresh; }
+        if (shm->track_seq == s1) { int fresh = s1 != lastSeq; track = t; lastSeq = s1; if (fresh) update_velocities(&track); return fresh; }
     }
     return 0;
 }
@@ -171,13 +177,120 @@ static XrPosef hand_pose(int hand, const char *comp, int *valid) {
 }
 
 // ---------------------------------------------------------------- spaces
+typedef enum {
+    TRACK_SLOT_HEAD = 0,
+    TRACK_SLOT_HAND_LEFT_AIM,
+    TRACK_SLOT_HAND_LEFT_GRIP,
+    TRACK_SLOT_HAND_RIGHT_AIM,
+    TRACK_SLOT_HAND_RIGHT_GRIP,
+    TRACK_SLOT_COUNT
+} TrackSlot;
+
+typedef struct {
+    XrPosef lastPose;
+    uint64_t lastTimeNs;
+    V linearVel;
+    V angularVel;
+    int valid;
+} VelocityTracker;
+
+static VelocityTracker velTrackers[TRACK_SLOT_COUNT];
+
+static void update_velocities(const VR4Tracking *t) {
+    if (!t || t->time_ns == 0) return;
+    for (int slot = 0; slot < TRACK_SLOT_COUNT; slot++) {
+        VelocityTracker *vt = &velTrackers[slot];
+        int slotValid = 0;
+        VR4Pose rawPose = {0};
+        switch (slot) {
+            case TRACK_SLOT_HEAD:
+                rawPose = t->head;
+                slotValid = 1;
+                break;
+            case TRACK_SLOT_HAND_LEFT_AIM:
+                if (t->hand[0].flags & VR4_HAND_POSE_VALID) { rawPose = t->hand[0].aim; slotValid = 1; }
+                break;
+            case TRACK_SLOT_HAND_LEFT_GRIP:
+                if (t->hand[0].flags & VR4_HAND_POSE_VALID) { rawPose = t->hand[0].grip; slotValid = 1; }
+                break;
+            case TRACK_SLOT_HAND_RIGHT_AIM:
+                if (t->hand[1].flags & VR4_HAND_POSE_VALID) { rawPose = t->hand[1].aim; slotValid = 1; }
+                break;
+            case TRACK_SLOT_HAND_RIGHT_GRIP:
+                if (t->hand[1].flags & VR4_HAND_POSE_VALID) { rawPose = t->hand[1].grip; slotValid = 1; }
+                break;
+            default: break;
+        }
+        if (!slotValid) {
+            vt->valid = 0;
+            vt->lastTimeNs = 0;
+            vt->linearVel = (V){0, 0, 0};
+            vt->angularVel = (V){0, 0, 0};
+            continue;
+        }
+        XrPosef p = xp(rawPose);
+        if (vt->valid && vt->lastTimeNs > 0 && t->time_ns > vt->lastTimeNs) {
+            double dt = (double)(t->time_ns - vt->lastTimeNs) * 1e-9;
+            if (dt >= 0.002 && dt <= 0.15) {
+                V instLinear = {
+                    (p.position.x - vt->lastPose.position.x) / (float)dt,
+                    (p.position.y - vt->lastPose.position.y) / (float)dt,
+                    (p.position.z - vt->lastPose.position.z) / (float)dt
+                };
+                Q qrel = qmul(p.orientation, qconj(vt->lastPose.orientation));
+                if (qrel.w < 0.0f) qrel = (Q){-qrel.x, -qrel.y, -qrel.z, -qrel.w};
+                if (qrel.w > 1.0f) qrel.w = 1.0f;
+                float angle = 2.0f * acosf(qrel.w);
+                float sinHalf = sqrtf(fmaxf(0.0f, 1.0f - qrel.w * qrel.w));
+                V instAngular = {0, 0, 0};
+                if (sinHalf > 1e-4f && angle > 1e-4f) {
+                    float factor = (angle / (float)dt) / sinHalf;
+                    instAngular = (V){qrel.x * factor, qrel.y * factor, qrel.z * factor};
+                }
+                float vMag = sqrtf(instLinear.x * instLinear.x + instLinear.y * instLinear.y + instLinear.z * instLinear.z);
+                if (vMag > 40.0f) {
+                    float s = 40.0f / vMag;
+                    instLinear = (V){instLinear.x * s, instLinear.y * s, instLinear.z * s};
+                }
+                float wMag = sqrtf(instAngular.x * instAngular.x + instAngular.y * instAngular.y + instAngular.z * instAngular.z);
+                if (wMag > 100.0f) {
+                    float s = 100.0f / wMag;
+                    instAngular = (V){instAngular.x * s, instAngular.y * s, instAngular.z * s};
+                }
+                if (vt->linearVel.x != 0 || vt->linearVel.y != 0 || vt->linearVel.z != 0) {
+                    vt->linearVel.x = 0.75f * instLinear.x + 0.25f * vt->linearVel.x;
+                    vt->linearVel.y = 0.75f * instLinear.y + 0.25f * vt->linearVel.y;
+                    vt->linearVel.z = 0.75f * instLinear.z + 0.25f * vt->linearVel.z;
+                    vt->angularVel.x = 0.75f * instAngular.x + 0.25f * vt->angularVel.x;
+                    vt->angularVel.y = 0.75f * instAngular.y + 0.25f * vt->angularVel.y;
+                    vt->angularVel.z = 0.75f * instAngular.z + 0.25f * vt->angularVel.z;
+                } else {
+                    vt->linearVel = instLinear;
+                    vt->angularVel = instAngular;
+                }
+            }
+        }
+        vt->lastPose = p;
+        vt->lastTimeNs = t->time_ns;
+        vt->valid = 1;
+    }
+}
+
+static XrPosef current_local_origin(const Session *s) {
+    if (!s) return IDENT;
+    float ws = current_world_scale();
+    XrPosef o = s->localOrigin;
+    o.position = (V){s->localOriginRaw.x / ws, s->localOriginRaw.y / ws, s->localOriginRaw.z / ws};
+    return o;
+}
+
 static XrPosef space_in_stage(Space *s, int *valid) {
     *valid = 1;
     if (s->ref) switch (s->type) {
         case XR_REFERENCE_SPACE_TYPE_VIEW: return pmul(xp(frameTrack.head), s->offset);
-        case XR_REFERENCE_SPACE_TYPE_LOCAL: return pmul(((Session *)s->session)->localOrigin, s->offset);
+        case XR_REFERENCE_SPACE_TYPE_LOCAL: return pmul(current_local_origin((Session *)s->session), s->offset);
         case XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR: {
-            XrPosef o = ((Session *)s->session)->localOrigin; o.position.y = 0; return pmul(o, s->offset);
+            XrPosef o = current_local_origin((Session *)s->session); o.position.y = 0; return pmul(o, s->offset);
         }
         default: return s->offset;
     }
@@ -188,13 +301,64 @@ static XrPosef space_in_stage(Space *s, int *valid) {
     *valid = 0;
     return IDENT;
 }
+
+static void space_velocity_in_stage(Space *s, V *outLinear, V *outAngular, int *valid) {
+    *valid = 1;
+    *outLinear = (V){0, 0, 0};
+    *outAngular = (V){0, 0, 0};
+    if (!s) { *valid = 0; return; }
+    if (s->ref) {
+        switch (s->type) {
+            case XR_REFERENCE_SPACE_TYPE_STAGE:
+            case XR_REFERENCE_SPACE_TYPE_LOCAL:
+            case XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR:
+                *valid = 1;
+                return;
+            case XR_REFERENCE_SPACE_TYPE_VIEW: {
+                VelocityTracker *vt = &velTrackers[TRACK_SLOT_HEAD];
+                *valid = vt->valid;
+                if (!vt->valid) return;
+                XrPosef headPose = xp(frameTrack.head);
+                V r = qrot(headPose.orientation, s->offset.position);
+                *outLinear = vadd(vt->linearVel, vcross(vt->angularVel, r));
+                *outAngular = vt->angularVel;
+                return;
+            }
+            default:
+                *valid = 0;
+                return;
+        }
+    }
+    for (int i = 0; i < s->action->nb; i++) {
+        Binding *b = &s->action->b[i];
+        if (is_pose_comp(b->comp) && sub_matches(s->sub, b->hand)) {
+            int isAim = !strcmp(b->comp, "aim/pose");
+            TrackSlot slot = (b->hand == 0) ? (isAim ? TRACK_SLOT_HAND_LEFT_AIM : TRACK_SLOT_HAND_LEFT_GRIP)
+                                            : (isAim ? TRACK_SLOT_HAND_RIGHT_AIM : TRACK_SLOT_HAND_RIGHT_GRIP);
+            VelocityTracker *vt = &velTrackers[slot];
+            *valid = vt->valid;
+            if (!vt->valid) return;
+            int hvalid;
+            XrPosef hp = hand_pose(b->hand, b->comp, &hvalid);
+            if (!hvalid) { *valid = 0; return; }
+            V r = qrot(hp.orientation, s->offset.position);
+            *outLinear = vadd(vt->linearVel, vcross(vt->angularVel, r));
+            *outAngular = vt->angularVel;
+            return;
+        }
+    }
+    *valid = 0;
+}
+
 static void set_local_origin(Session *s) {   // LOCAL = head position at start, yaw only
-    float ws = current_world_scale();
     Q q = {track.head.qx, track.head.qy, track.head.qz, track.head.qw};
     V f = qrot(q, (V){0, 0, -1});
     float yaw = atan2f(-f.x, -f.z);
-    s->localOrigin = (XrPosef){{0, sinf(yaw / 2), 0, cosf(yaw / 2)}, {track.head.px / ws, track.head.py / ws, track.head.pz / ws}};
-    if (track.time_ns == 0) s->localOrigin.position.y = 1.6f / ws;
+    s->localOrigin.orientation = (Q){0, sinf(yaw / 2), 0, cosf(yaw / 2)};
+    s->localOriginRaw = (V){track.head.px, track.head.py, track.head.pz};
+    if (track.time_ns == 0) s->localOriginRaw.y = 1.6f;
+    float ws = current_world_scale();
+    s->localOrigin.position = (V){s->localOriginRaw.x / ws, s->localOriginRaw.y / ws, s->localOriginRaw.z / ws};
 }
 
 // ---------------------------------------------------------------- instance
@@ -383,6 +547,7 @@ static XrResult XRAPI_CALL xrDestroySession_(XrSession h) {
     for (int k = 0; k < NSTAGE; k++)
         for (int i = 0; i < 2; i++)
             if (s->staging[k][i]) ID3D11Texture2D_Release(s->staging[k][i]);
+    if (s->fallback) ID3D11Texture2D_Release(s->fallback);
     ID3D11DeviceContext_Release(s->ctx); ID3D11Device_Release(s->dev);
     if (theSession == s) theSession = NULL;
     free(s);
@@ -427,7 +592,8 @@ static XrResult XRAPI_CALL xrCreateReferenceSpace_(XrSession h, const XrReferenc
 static XrResult XRAPI_CALL xrGetReferenceSpaceBoundsRect_(XrSession h, XrReferenceSpaceType t, XrExtent2Df *b) {
     (void)h;
     if (t != XR_REFERENCE_SPACE_TYPE_STAGE) { b->width = b->height = 0; return XR_SPACE_BOUNDS_UNAVAILABLE; }
-    b->width = 2; b->height = 2; return XR_SUCCESS;   // ponytail: fixed 2x2 m play area, send the Quest guardian later
+    float ws = current_world_scale();
+    b->width = 2.0f / ws; b->height = 2.0f / ws; return XR_SUCCESS;   // fixed 2x2 m play area scaled to stage
 }
 static XrResult XRAPI_CALL xrCreateActionSpace_(XrSession h, const XrActionSpaceCreateInfo *ci, XrSpace *out) {
     Space *s = calloc(1, sizeof *s);
@@ -444,9 +610,21 @@ static XrResult XRAPI_CALL xrLocateSpace_(XrSpace sp, XrSpace base, XrTime t, Xr
     for (XrBaseOutStructure *n = loc->next; n; n = n->next)
         if (n->type == XR_TYPE_SPACE_VELOCITY) {
             XrSpaceVelocity *sv = (XrSpaceVelocity *)n;
-            sv->velocityFlags = 0;
-            sv->linearVelocity = (XrVector3f){0, 0, 0};
-            sv->angularVelocity = (XrVector3f){0, 0, 0};
+            V va, wa, vb, wb;
+            int vvel1 = 0, vvel2 = 0;
+            space_velocity_in_stage((Space *)sp, &va, &wa, &vvel1);
+            space_velocity_in_stage((Space *)base, &vb, &wb, &vvel2);
+            if (v1 && v2 && vvel1 && vvel2) {
+                V relLin = vsub(va, vb);
+                V relAng = vsub(wa, wb);
+                sv->linearVelocity = qrot(qconj(b.orientation), relLin);
+                sv->angularVelocity = qrot(qconj(b.orientation), relAng);
+                sv->velocityFlags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
+            } else {
+                sv->velocityFlags = 0;
+                sv->linearVelocity = (XrVector3f){0, 0, 0};
+                sv->angularVelocity = (XrVector3f){0, 0, 0};
+            }
         }
     return XR_SUCCESS;
 }
@@ -521,9 +699,72 @@ static XrResult XRAPI_CALL xrEndFrame_(XrSession h, const XrFrameEndInfo *fi) {
     endSum += qpc_ns() - endT0;
     return r;
 }
+// Fallback for apps that submit quad layers without a stereo projection (menus, media players):
+// letterbox the first quad into both eyes so the headset shows something instead of a stale frame.
+static XrResult XRAPI_CALL endFrameQuad(Session *s, const XrFrameEndInfo *fi) {
+    const XrCompositionLayerQuad *q = NULL;
+    for (uint32_t i = 0; i < fi->layerCount; i++)
+        if (fi->layers[i] && fi->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_QUAD) { q = (const XrCompositionLayerQuad *)fi->layers[i]; break; }
+    if (!q) {
+        static int warned_eq;
+        for (uint32_t i = 0; i < fi->layerCount; i++)
+            if (fi->layers[i] && fi->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_EQUIRECT_KHR && !warned_eq++)
+                logmsg("equirect layers are not composited yet");
+        return XR_SUCCESS;
+    }
+    Swapchain *sc = find_sc(q->subImage.swapchain);
+    if (!sc || sc->released < 0) return XR_SUCCESS;
+    uint32_t sw = (uint32_t)q->subImage.imageRect.extent.width, sh = (uint32_t)q->subImage.imageRect.extent.height;
+    int32_t ox = q->subImage.imageRect.offset.x, oy = q->subImage.imageRect.offset.y;
+    if (!sw || !sh || ox < 0 || oy < 0 || (uint32_t)ox + sw > sc->w || (uint32_t)oy + sh > sc->h ||
+        q->subImage.imageArrayIndex >= sc->array) return XR_SUCCESS;
+    if (!s->fallback || s->fbW != sw || s->fbH != sh) {
+        if (s->fallback) { ID3D11Texture2D_Release(s->fallback); s->fallback = NULL; }
+        D3D11_TEXTURE2D_DESC d = {sw, sh, 1, 1, sc->fmt, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
+        if (FAILED(ID3D11Device_CreateTexture2D(s->dev, &d, NULL, &s->fallback))) { s->fallback = NULL; return XR_SUCCESS; }
+        s->fbW = sw; s->fbH = sh;
+    }
+    D3D11_BOX box = {(UINT)ox, (UINT)oy, 0, (UINT)(ox + (int32_t)sw), (UINT)(oy + (int32_t)sh), 1};
+    ID3D11DeviceContext_CopySubresourceRegion(s->ctx, (ID3D11Resource *)s->fallback, 0, 0, 0, 0,
+        (ID3D11Resource *)sc->img[sc->released], q->subImage.imageArrayIndex * sc->mips, &box);
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(ID3D11DeviceContext_Map(s->ctx, (ID3D11Resource *)s->fallback, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m))) return XR_SUCCESS;
+    uint32_t dw = eye_w(), dh = eye_h();
+    if (2ULL * dw * dh * 4ULL > (uint64_t)VR4_FRAME_MAX) { ID3D11DeviceContext_Unmap(s->ctx, (ID3D11Resource *)s->fallback, 0); return XR_SUCCESS; }
+    uint32_t buf = (shm->frame_seq + 1) % 2;
+    uint8_t *dst = vr4_frame(shm, buf);
+    float scf = (float)dw / sw < (float)dh / sh ? (float)dw / sw : (float)dh / sh;
+    uint32_t tw = (uint32_t)(sw * scf), th = (uint32_t)(sh * scf);
+    if (!tw) tw = 1;
+    if (!th) th = 1;
+    if (tw > dw) tw = dw;
+    if (th > dh) th = dh;
+    uint32_t x0 = (dw - tw) / 2, y0 = (dh - th) / 2;
+    memset(dst, 0, (size_t)2 * dw * dh * 4);
+    for (uint32_t y = 0; y < th; y++) {
+        const uint32_t *src = (const uint32_t *)((const uint8_t *)m.pData + (size_t)(y * sh / th) * m.RowPitch);
+        for (int e = 0; e < 2; e++) {
+            uint32_t *out = (uint32_t *)(dst + ((size_t)(y0 + y) * 2 * dw + (size_t)e * dw + x0) * 4);
+            for (uint32_t x = 0; x < tw; x++) out[x] = src[x * sw / tw];
+        }
+    }
+    ID3D11DeviceContext_Unmap(s->ctx, (ID3D11Resource *)s->fallback, 0);
+    shm->frame_w[buf] = 2 * dw; shm->frame_h[buf] = dh; shm->frame_rgba[buf] = (uint32_t)is_rgba(sc->fmt);
+    shm->frame_time_ns[buf] = (uint64_t)fi->displayTime;
+    shm->frame_eye_pose[buf][0] = frameTrack.head; shm->frame_eye_pose[buf][1] = frameTrack.head;
+    s->lastPublished = (uint64_t)fi->displayTime;
+    shm->runtime_heartbeat_ns = (uint64_t)qpc_ns();
+    vr4_fence();
+    shm->frame_seq++;
+    return XR_SUCCESS;
+}
 static XrResult XRAPI_CALL xrEndFrameImpl(XrSession h, const XrFrameEndInfo *fi) {
     Session *s = (Session *)h;
     if (!s || !s->dev || !s->ctx || !fi) return XR_ERROR_HANDLE_INVALID;
+    if (fi->displayTime && (uint64_t)fi->displayTime == s->lastPublished) {
+        shm->runtime_heartbeat_ns = (uint64_t)qpc_ns();   // same frame re-submitted: no new pixels, stay alive
+        return XR_SUCCESS;
+    }
     const XrCompositionLayerProjection *proj = NULL;
     for (uint32_t i = 0; i < fi->layerCount; i++)
         if (fi->layers[i] && fi->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) { proj = (const XrCompositionLayerProjection *)fi->layers[i]; break; }
@@ -537,7 +778,7 @@ static XrResult XRAPI_CALL xrEndFrameImpl(XrSession h, const XrFrameEndInfo *fi)
                    si->imageRect.extent.width, si->imageRect.extent.height, si->imageArrayIndex);
         }
     }
-    if (!proj || proj->viewCount < 2) return XR_SUCCESS;   // ponytail: quad/overlay layers are ignored
+    if (!proj || proj->viewCount < 2) return endFrameQuad(s, fi);   // no stereo projection: quad fallback or nothing
 
     Swapchain *sc[2] = { find_sc(proj->views[0].subImage.swapchain), find_sc(proj->views[1].subImage.swapchain) };
     if (!sc[0] || !sc[1]) {
@@ -655,6 +896,7 @@ static XrResult XRAPI_CALL xrEndFrameImpl(XrSession h, const XrFrameEndInfo *fi)
     s->stagingReady[readStage] = 0;
     shm->frame_w[buf] = 2 * (uint32_t)w; shm->frame_h[buf] = (uint32_t)hgt; shm->frame_rgba[buf] = (uint32_t)isRgbaFmt;
     shm->frame_time_ns[buf] = s->stagingDisplayTime[readStage];
+    s->lastPublished = (uint64_t)fi->displayTime;
     copySum += qpc_ns() - copyT0;
     shm->runtime_heartbeat_ns = (uint64_t)qpc_ns();
     vr4_fence();
@@ -676,7 +918,9 @@ static XrResult XRAPI_CALL xrCreateSwapchain_(XrSession h, const XrSwapchainCrea
     int ok = 0;
     for (int i = 0; i < 4; i++) ok |= formats[i] == ci->format;
     if (!ok) { logmsg("swapchain format %lld unsupported", (long long)ci->format); return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED; }
-    if (ci->sampleCount > 1) return XR_ERROR_FEATURE_UNSUPPORTED;
+    if (ci->sampleCount > 1) {
+        static int warned_msaa; if (!warned_msaa++) logmsg("swapchain asks %u samples: accepted without MSAA (game renders unaliased)", ci->sampleCount);
+    }
     logmsg("swapchain fmt %lld %ux%u array %u mips %u faces %u usage 0x%llx flags 0x%llx", (long long)ci->format, ci->width, ci->height,
            ci->arraySize, ci->mipCount, ci->faceCount, (unsigned long long)ci->usageFlags, (unsigned long long)ci->createFlags);
     Swapchain *sc = calloc(1, sizeof *sc);
