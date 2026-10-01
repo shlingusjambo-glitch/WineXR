@@ -26,7 +26,10 @@ so a matching pair is always deployed together. Manual equivalent: copy
 
 Beyond core OpenXR 1.0 the runtime answers: `XR_FB_display_refresh_rate`
 (enumerate/get/request, fed from shm fps), `XR_FB_color_space` (enumerate/set,
-supporting Quest, Rec.709, and unmanaged), `XR_KHR_win32_convert_performance_counter_time`,
+supporting Quest, Rec.709, and unmanaged), quad layers (letterboxed into both
+eyes when no stereo projection is submitted), MSAA swapchains (accepted,
+rendered unaliased), duplicate-displayTime submits (skipped, heartbeat kept),
+`XR_KHR_win32_convert_performance_counter_time`,
 `XR_KHR_composition_layer_depth`, `_cylinder`, and `_color_scale_bias` (accepted),
 `XR_EXT_local_floor` (maps to stage with floor offset, fully enumerated in
 `xrEnumerateReferenceSpaces`), and `XR_KHR_visibility_mask` (empty mask); unknown reference

@@ -9,6 +9,8 @@ bundled in this repository or in the release archives.
 
 | Component | Source | License |
 |---|---|---|
+| OpenXR headers (`SiliconXR/include/openxr/`) | [KhronosGroup/OpenXR-SDK](https://github.com/KhronosGroup/OpenXR-SDK) 1.1.63 | Apache-2.0 OR MIT |
+| OpenVR C API header (`SiliconXR/openvr_capi.h`) | [ValveSoftware/openvr](https://github.com/ValveSoftware/openvr) v1.23.7 | BSD-3-Clause (Copyright (c) 2015, Valve Corporation) |
 | Quest controller meshes (`mac/Resources/controllers/*.glb`) | [webxr-input-profiles assets](https://github.com/immersive-web/webxr-input-profiles) 1.0.20, see `mac/Resources/controllers/SOURCE.txt` | W3C Software and Document License (full text in `mac/Resources/controllers/LICENSE`) |
 | UI sounds (`mac/Resources/sounds/*.wav`) | Android Open Source Project (`frameworks/base/data/sounds/effects`) | Apache License 2.0 (see `mac/Resources/sounds/LICENSE-AOSP.txt`); synthesized PCM in `UISounds.swift` is the fallback |
 | Welcome-tour music (`mac/Resources/sounds/oobe-music.mp3`) | Supplied by the project author | Free-use track, redistributed with the author's permission |

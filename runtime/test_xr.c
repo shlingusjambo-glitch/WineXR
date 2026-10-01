@@ -18,6 +18,9 @@ static XrInstance inst;
 #define FN(name) PFN_##name name; gipa(inst, #name, (PFN_xrVoidFunction *)&name)
 
 int main(int argc, char **argv) {
+    // Sikarugir engine wine disconnects console stdout: VR4_TEST_LOG=C:\path\file redirects it.
+    const char *logf = getenv("VR4_TEST_LOG");
+    if (logf) freopen(logf, "w", stdout);
     int frames = argc > 1 ? atoi(argv[1]) : 10;
     HMODULE dll = LoadLibraryA("vr4mac_openxr.dll");
     if (!dll) { printf("FAIL load dll\n"); return 1; }
