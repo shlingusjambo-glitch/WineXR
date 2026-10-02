@@ -14,7 +14,7 @@ enum { VR4_HELLO = 1, VR4_CONFIG = 2, VR4_TRACKING = 3, VR4_VIDEO = 4, VR4_HAPTI
 // + mono PCM s16le, 48000 Hz, 480 samples (10 ms, 960 bytes) per packet.
 enum { VR4_BTN_A = 1, VR4_BTN_B = 2, VR4_BTN_X = 4, VR4_BTN_Y = 8, VR4_BTN_MENU = 16, VR4_BTN_STICK_CLICK = 32,
        VR4_BTN_TRIGGER_TOUCH = 64, VR4_BTN_THUMB_TOUCH = 128, VR4_BTN_STICK_TOUCH = 256 };
-enum { VR4_HAND_ACTIVE = 1, VR4_HAND_POSE_VALID = 2 };
+enum { VR4_HAND_ACTIVE = 1, VR4_HAND_POSE_VALID = 2, VR4_HAND_TRACKED = 4, VR4_HAND_PINCH_READY = 8 };   // 4/8: a tracked hand (no controller); its pinch is the trigger, 8 = thumb and index poised to pinch
 static const uint32_t VR4_MAX_PAYLOAD = 8u << 20;
 
 #pragma pack(push, 1)
@@ -30,6 +30,11 @@ typedef struct {                       // VR4_TRACKING payload, exact wire layou
     VR4Eye eye[2];
     VR4Hand hand[2];
 } VR4Tracking;
+
+// Hand tracking: while a hand is tracked (controllers put down) the VR4_TRACKING payload is followed by
+// VR4HandJoints[2] (left, right): the 26 XR_EXT_hand_tracking joints in OpenXR order, same space as the poses.
+enum { VR4_HAND_JOINTS = 26 };
+typedef struct { uint32_t tracked; VR4Pose joint[VR4_HAND_JOINTS]; } VR4HandJoints;
 
 typedef struct { uint64_t frame_id, time_ns; uint8_t flags; } VR4VideoHeader;  // followed by Annex-B NALs
 typedef struct { uint8_t hand; float amplitude, duration_s, frequency_hz; } VR4Haptics;
