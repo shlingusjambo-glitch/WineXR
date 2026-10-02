@@ -1,10 +1,13 @@
-// VR4Mac OpenXR runtime: a Windows DLL loaded by games (directly, or via OpenComposite for OpenVR games)
+// VR4Mac OpenXR runtime (WineXR): a Windows DLL loaded by games (directly, or via OpenComposite for OpenVR games)
 // inside Wine. Poses/input come from the Mac app through shared memory (common/vr4mac.h); rendered eye
-// images are copied back the same way and streamed to the Quest by the Mac app. D3D11 only.
+// images (plus quad/cylinder layers, composited on the GPU) are copied back the same way and streamed to the
+// Quest by the Mac app. D3D11, or D3D12 (projection layers only).
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d12.h>
+#include <d3dcompiler.h>
 #include <dxgi.h>
 #include <math.h>
 #include <stdarg.h>
@@ -13,6 +16,7 @@
 #include <string.h>
 #define XR_USE_PLATFORM_WIN32
 #define XR_USE_GRAPHICS_API_D3D11
+#define XR_USE_GRAPHICS_API_D3D12
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/openxr_loader_negotiation.h>
@@ -20,16 +24,31 @@
 #include "../common/vr4mac.h"
 
 #define EXPORT __declspec(dllexport)
-#define MAXN 256
 #define NSTAGE 4   // readback ring depth (GPU latency under D3DMetal is >1 frame)
 
 static VR4Shm *shm;
 static FILE *logfile;
+static char shmPath[MAX_PATH], logPath[MAX_PATH + 8];
+static void init_paths(void) {   // VR4_SHM=<windows path> points tests at their own block (log goes next to it)
+    if (*shmPath) return;
+    if (GetEnvironmentVariableA("VR4_SHM", shmPath, MAX_PATH) - 1u < MAX_PATH - 1u) snprintf(logPath, sizeof logPath, "%s.log", shmPath);
+    else { strcpy(shmPath, VR4_SHM_PATH_WIN); strcpy(logPath, "Z:\\tmp\\vr4mac\\runtime.log"); }
+}
 static void logmsg(const char *fmt, ...) {
-    if (!logfile) logfile = fopen("Z:\\tmp\\vr4mac\\runtime.log", "a");
+    init_paths();
+    if (!logfile) logfile = fopen(logPath, "a");
     if (!logfile) return;
     va_list a; va_start(a, fmt); vfprintf(logfile, fmt, a); va_end(a); fputc('\n', logfile); fflush(logfile);
 }
+static void logonce(const char *fmt, ...) {   // each distinct message once per process (unsupported calls, layers, bindings)
+    static char *seen[256]; static int n;
+    char m[512]; va_list a; va_start(a, fmt); vsnprintf(m, sizeof m, fmt, a); va_end(a);
+    for (int i = 0; i < n; i++) if (!strcmp(seen[i], m)) return;
+    if (n == 256) return;
+    seen[n++] = _strdup(m);
+    logmsg("%s", m);
+}
+static void rel(void *com) { if (com) IUnknown_Release((IUnknown *)com); }
 
 static float current_render_scale(void) {
     return (shm && shm->render_scale > 0.01f) ? shm->render_scale : 1.0f;
@@ -53,15 +72,33 @@ static XrPosef pmul(XrPosef a, XrPosef b) {   // b expressed in a's frame -> a's
 static inline V vcross(V a, V b) { return (V){a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
 static inline V vadd(V a, V b) { return (V){a.x + b.x, a.y + b.y, a.z + b.z}; }
 static inline V vsub(V a, V b) { return (V){a.x - b.x, a.y - b.y, a.z - b.z}; }
+static inline V vscale(V a, float s) { return (V){a.x * s, a.y * s, a.z * s}; }
+static inline float vlen(V a) { return sqrtf(a.x * a.x + a.y * a.y + a.z * a.z); }
+static inline float clamp01(float v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
 static XrPosef pinv(XrPosef a) {
     Q c = qconj(a.orientation); V t = qrot(c, a.position);
     return (XrPosef){c, {-t.x, -t.y, -t.z}};
 }
-static XrPosef xp(VR4Pose p) {
+static XrPosef xp(VR4Pose p) {   // shared-memory (raw stage metres) -> app units
     float ws = current_world_scale();
     return (XrPosef){{p.qx, p.qy, p.qz, p.qw}, {p.px / ws, p.py / ws, p.pz / ws}};
 }
+static VR4Pose raw_pose(XrPosef p) {   // app units -> raw stage metres
+    float ws = current_world_scale();
+    return (VR4Pose){p.position.x * ws, p.position.y * ws, p.position.z * ws, p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w};
+}
 static const XrPosef IDENT = {{0, 0, 0, 1}, {0, 0, 0}};
+/// Finite-difference velocity a -> b over dt seconds (clamped against tracking glitches).
+static void pose_velocity(XrPosef a, XrPosef b, float dt, V *lin, V *ang) {
+    *lin = vscale(vsub(b.position, a.position), 1 / dt);
+    Q r = qmul(b.orientation, qconj(a.orientation));
+    if (r.w < 0) r = (Q){-r.x, -r.y, -r.z, -r.w};
+    float sinHalf = sqrtf(fmaxf(0, 1 - r.w * r.w)), angle = 2 * acosf(fminf(r.w, 1));
+    *ang = sinHalf > 1e-4f && angle > 1e-4f ? vscale((V){r.x, r.y, r.z}, angle / dt / sinHalf) : (V){0, 0, 0};
+    float l = vlen(*lin), w = vlen(*ang);
+    if (l > 40) *lin = vscale(*lin, 40 / l);
+    if (w > 100) *ang = vscale(*ang, 100 / w);
+}
 
 // ---------------------------------------------------------------- paths
 static char *paths[4096]; static int npaths;
@@ -72,34 +109,47 @@ static XrPath intern(const char *s) {
     return ++npaths;
 }
 static const char *pstr(XrPath p) { return p >= 1 && p <= (XrPath)npaths ? paths[p - 1] : ""; }
+static XrPath handPath[2];   // /user/hand/left, /user/hand/right
 
 // ---------------------------------------------------------------- objects
-typedef struct { int hand; char comp[64]; } Binding;
+typedef struct { XrPath path; int8_t hand; uint8_t src, hi; } Binding;   // hi: from the hand-interaction profile
 typedef struct { uint32_t gen; float cur[2], prev[2]; } ActionHistory;
-typedef struct Action { XrActionType type; char name[64]; XrPath sub[8]; int nsub; Binding b[16]; int nb; ActionHistory hist[3]; } Action;
+typedef struct Action { XrActionType type; char name[64]; XrPath sub[8]; int nsub; Binding b[32]; int nb; ActionHistory hist[3]; } Action;
 typedef struct { char name[64]; } ActionSet;
 typedef struct { XrPath profile; Action *action; XrPath binding; } Suggestion;
 typedef struct {
     XrSession session; int ref; XrReferenceSpaceType type; Action *action; XrPath sub; XrPosef offset;
 } Space;
 typedef struct {
-    ID3D11Texture2D *img[3]; int count, acquired, released; DXGI_FORMAT fmt; uint32_t w, h, array, mips;
+    ID3D11Texture2D *img[3]; ID3D12Resource *img12[3]; int count, acquired, released; DXGI_FORMAT fmt; uint32_t w, h, array, mips;
 } Swapchain;
+typedef struct { int hand, unobstructed; } HandTracker;
 typedef struct {
     ID3D11Device *dev; ID3D11DeviceContext *ctx; int running, focused, exitRequested;
-    ID3D11Texture2D *staging[NSTAGE][2]; DXGI_FORMAT stagingFmt; uint32_t stagingW, stagingH; uint64_t stagingCounter;
+    ID3D11Texture2D *staging[NSTAGE]; DXGI_FORMAT stagingFmt; uint32_t stagingW, stagingH; uint64_t stagingCounter;   // side-by-side readback ring
     uint64_t stagingReady[NSTAGE]; VR4Pose stagingPose[NSTAGE][2]; uint64_t stagingDisplayTime[NSTAGE]; // stagingReady: submit order, 0 = free
-    XrPosef localOrigin; V localOriginRaw; XrPath profile;
+    XrPosef localOrigin; V localOriginRaw;
+    XrPath profile, handProfile; int handHi[2];   // controller / hand-interaction profile; handHi[h]: hand h uses the latter now
     uint64_t lastPublished;   // displayTime of the last actually-published frame (duplicate-submit skip)
-    ID3D11Texture2D *fallback; uint32_t fbW, fbH;   // quad-layer fallback staging
+    // layer compositor, created with the first quad/cylinder layer (compOk -1: shaders unavailable)
+    int compOk; ID3D11VertexShader *vs; ID3D11PixelShader *ps; ID3D11InputLayout *il; ID3D11Buffer *vb, *cb;
+    ID3D11SamplerState *smp; ID3D11BlendState *blend[2]; ID3D11RasterizerState *rs;
+    ID3D11Texture2D *target; ID3D11RenderTargetView *rtv; DXGI_FORMAT targetFmt; uint32_t targetW, targetH;
+    // D3D12 sessions: the readback ring is buffers filled by our own command lists on the game's queue
+    ID3D12Device *dev12; ID3D12CommandQueue *queue; ID3D12Fence *fence; HANDLE fenceEvent; uint64_t fenceValue;
+    ID3D12CommandAllocator *alloc[NSTAGE]; ID3D12GraphicsCommandList *cl[NSTAGE]; ID3D12Resource *rb[NSTAGE]; uint64_t rbFence[NSTAGE]; uint32_t rbPitch;
 } Session;
 
 
 static Suggestion sugg[1024]; static int nsugg;
 static VR4Tracking track;           // input snapshot (hands/buttons), refreshed by xrSyncActions
+static VR4HandJoints joints[2], prevJoints[2]; static uint64_t jointsNs, prevJointsNs;   // hand-tracking snapshot (+ previous, for velocities)
 static VR4Tracking frameTrack;      // head/eyes of the latest xrWaitFrame
 static VR4Tracking frameRing[4]; static int frameRingN;   // recent xrWaitFrame snapshots, for pipelined apps
+static const VR4Tracking noHeadset = {0, {0, 1.6f, 0, 0, 0, 0, 1},   // until the first tracking sample
+    {{{-0.032f, 1.6f, 0, 0, 0, 0, 1}, {-0.8f, 0.8f, 0.8f, -0.8f}}, {{0.032f, 1.6f, 0, 0, 0, 0, 1}, {-0.8f, 0.8f, 0.8f, -0.8f}}}};
 static uint32_t lastSeq;
+static int64_t lastSampleNs;        // when the latest fresh tracking sample was read (QPC ns)
 static uint32_t syncGen;   // bumped by xrSyncActions
 static XrEventDataBuffer events[64]; static int evHead, evTail;
 static Session *theSession;
@@ -109,71 +159,159 @@ static int64_t qpcOffsetNs;         // XrTime - QPC time
 
 static int64_t qpc_ns(void) { LARGE_INTEGER c; QueryPerformanceCounter(&c); return (int64_t)((double)c.QuadPart * 1e9 / (double)qpf.QuadPart); }
 
-static void push_state(XrSessionState st) {
+static XrEventDataBuffer *new_event(XrStructureType type) {
     if (evTail - evHead >= 64) evHead = evTail - 63;
-    XrEventDataSessionStateChanged *e = (XrEventDataSessionStateChanged *)&events[evTail % 64];
-    memset(e, 0, sizeof(XrEventDataBuffer));
-    e->type = XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED; e->session = (XrSession)theSession; e->state = st;
-    e->time = qpc_ns() + qpcOffsetNs;
-    evTail++;
+    XrEventDataBuffer *e = &events[evTail++ % 64];
+    memset(e, 0, sizeof *e); e->type = type;
+    return e;
+}
+static void push_state(XrSessionState st) {
+    XrEventDataSessionStateChanged *e = (XrEventDataSessionStateChanged *)new_event(XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED);
+    e->session = (XrSession)theSession; e->state = st; e->time = qpc_ns() + qpcOffsetNs;
 }
 
 /// Head/eye snapshot handed out by the xrWaitFrame that predicted `t` (falls back to the latest).
 static const VR4Tracking *frame_for(XrTime t) {
     for (int i = 0; i < 4; i++) if (frameRing[i].time_ns == (uint64_t)t && t) return &frameRing[i];
-    return &frameTrack;
+    return frameTrack.time_ns ? &frameTrack : &noHeadset;
 }
 static void update_velocities(const VR4Tracking *t);
-static int read_tracking(void) {   // seqlock read of the Mac app's latest tracking sample
+static int read_tracking(void) {   // seqlock read of the Mac app's latest tracking sample and hand joints
     for (int tries = 0; tries < 100; tries++) {
         uint32_t s1 = shm->track_seq; vr4_fence();
         if (s1 & 1) continue;
-        VR4Tracking t = shm->track; vr4_fence();
-        if (shm->track_seq == s1) { int fresh = s1 != lastSeq; track = t; lastSeq = s1; if (fresh) update_velocities(&track); return fresh; }
+        if (s1 == lastSeq) return 0;   // nothing new (xrWaitFrame polls this): skip the copy
+        VR4Tracking t = shm->track; VR4HandJoints j[2]; memcpy(j, shm->hand_joints, sizeof j); vr4_fence();
+        if (shm->track_seq != s1) continue;
+        track = t; lastSeq = s1; lastSampleNs = qpc_ns();
+        memcpy(prevJoints, joints, sizeof joints); prevJointsNs = jointsNs;
+        memcpy(joints, j, sizeof joints); jointsNs = t.time_ns;
+        update_velocities(&track);
+        return 1;
     }
     return 0;
 }
 
 // ---------------------------------------------------------------- input mapping
-static int btn(const VR4Hand *h, uint32_t bit) { return (h->buttons & bit) != 0; }
-/// Scalar value of an input component path suffix like "trigger/value" or "a/click".
-static float comp_value(const VR4Hand *h, const char *c) {
-    #define IS(p) (!strncmp(c, p, strlen(p)))
-    if (IS("trigger/touch")) return btn(h, VR4_BTN_TRIGGER_TOUCH);
-    if (IS("trigger") || IS("select")) return h->trigger;
-    if (IS("squeeze") || IS("grip/value") || IS("grip/click") || IS("grip/force") || IS("squeeze/force")) return h->squeeze;
-    if (IS("thumbstick/x") || IS("trackpad/x") || IS("joystick/x")) return h->stick_x;
-    if (IS("thumbstick/y") || IS("trackpad/y") || IS("joystick/y")) return h->stick_y;
-    if (IS("thumbstick/click") || IS("trackpad/click") || IS("joystick/click")) return btn(h, VR4_BTN_STICK_CLICK);
-    if (IS("thumbstick/touch") || IS("trackpad/touch") || IS("joystick/touch")) return btn(h, VR4_BTN_STICK_TOUCH);
-    if (IS("thumbrest/touch")) return btn(h, VR4_BTN_THUMB_TOUCH);
-    if (IS("a/click")) return btn(h, VR4_BTN_A);
-    if (IS("b/click")) return btn(h, VR4_BTN_B);
-    if (IS("x/click")) return btn(h, VR4_BTN_X);
-    if (IS("y/click")) return btn(h, VR4_BTN_Y);
-    if (IS("a/touch") || IS("b/touch") || IS("x/touch") || IS("y/touch")) return btn(h, VR4_BTN_THUMB_TOUCH);
-    if (IS("menu/click") || IS("system/click") || IS("menu") || IS("system")) return btn(h, VR4_BTN_MENU);
-    return 0;
-    #undef IS
+// Every suggested binding resolves once (at attach) to one of these sources on the Quest's Touch controllers (or
+// tracked hands). Other controllers' profiles are remapped: an Index/Vive "a"/"b" on the left hand is X/Y, a Vive
+// trackpad is the thumbstick, a missing right-hand menu button is B.
+enum { S_NONE, S_TRIGGER, S_TRIGGER_CLICK, S_TRIGGER_TOUCH, S_SQUEEZE, S_SQUEEZE_CLICK, S_STICK, S_STICK_X, S_STICK_Y,
+       S_STICK_CLICK, S_STICK_TOUCH, S_THUMB_TOUCH, S_THUMB_NEAR, S_LOWER, S_UPPER, S_MENU, S_SYSTEM, S_PAD_CLICK,
+       S_PINCH_READY, S_GRASP, S_GRASP_READY, S_HAPTIC, S_AIM, S_GRIP, S_PINCH_POSE, S_POKE_POSE };
+#define IS_POSE(s) ((s) >= S_AIM)
+enum { P_STICK = 1, P_FACE = 2, P_HAND = 4 };   // profile has a thumbstick / face buttons / is the hand-interaction profile
+static const struct { const char *path; int flags; } profiles[] = {   // controller profiles in preference order
+    {"/interaction_profiles/oculus/touch_controller", P_STICK | P_FACE},
+    {"/interaction_profiles/meta/touch_controller_plus", P_STICK | P_FACE},
+    {"/interaction_profiles/meta/touch_plus_controller", P_STICK | P_FACE},
+    {"/interaction_profiles/facebook/touch_controller_pro", P_STICK | P_FACE},
+    {"/interaction_profiles/meta/touch_pro_controller", P_STICK | P_FACE},
+    {"/interaction_profiles/valve/index_controller", P_STICK | P_FACE},
+    {"/interaction_profiles/hp/mixed_reality_controller", P_STICK | P_FACE},
+    {"/interaction_profiles/htc/vive_cosmos_controller", P_STICK | P_FACE},
+    {"/interaction_profiles/microsoft/motion_controller", P_STICK},
+    {"/interaction_profiles/htc/vive_controller", 0},
+    {"/interaction_profiles/khr/simple_controller", 0},
+    {"/interaction_profiles/ext/hand_interaction_ext", P_HAND},
+};
+#define NPROF (int)(sizeof profiles / sizeof *profiles)
+static int profile_index(XrPath p) { for (int i = 0; i < NPROF; i++) if (!strcmp(pstr(p), profiles[i].path)) return i; return -1; }
+static int profile_flags(XrPath p) { int i = profile_index(p); return i < 0 ? P_STICK | P_FACE : profiles[i].flags; }
+
+/// Component path after /input/ ("trigger/value", "a/click", "thumbstick") -> source, for `hand` of a profile with `flags`.
+static int resolve(const char *c, int flags, int hand, int output) {
+    if (output) return S_HAPTIC;
+    const char *slash = strchr(c, '/'), *comp = slash ? slash + 1 : "";
+    size_t n = slash ? (size_t)(slash - c) : strlen(c);
+    #define ID(s) (n == sizeof(s) - 1 && !strncmp(c, s, n))
+    #define C(s) (!strcmp(comp, s))
+    if (ID("trigger")) return C("touch") || C("proximity_fb") || C("curl_meta") || C("curl_fb") ? S_TRIGGER_TOUCH :
+                              C("click") ? S_TRIGGER_CLICK : C("slide_meta") || C("slide_fb") ? S_NONE : S_TRIGGER;
+    if (ID("trigger_meta")) return S_TRIGGER_TOUCH;   // proximity_meta
+    if (ID("select")) return S_TRIGGER_CLICK;
+    if (ID("squeeze")) return C("click") ? S_SQUEEZE_CLICK : S_SQUEEZE;
+    if (ID("thumbstick") || ID("joystick"))
+        return C("x") ? S_STICK_X : C("y") ? S_STICK_Y : C("click") ? S_STICK_CLICK : C("touch") ? S_STICK_TOUCH : S_STICK;
+    if (ID("trackpad")) {   // a Vive's only thumb input is its pad; a pad next to a real stick (Index, WMR) stays idle
+        if (flags & P_STICK) return C("click") ? S_LOWER : S_NONE;
+        return C("x") ? S_STICK_X : C("y") ? S_STICK_Y : C("click") ? S_PAD_CLICK : C("touch") ? S_STICK_TOUCH : C("force") ? S_NONE : S_STICK;
+    }
+    if (ID("a") || ID("x")) return C("touch") ? S_THUMB_TOUCH : S_LOWER;
+    if (ID("b") || ID("y")) return C("touch") ? S_THUMB_TOUCH : S_UPPER;
+    if (ID("thumbrest")) return C("touch") ? S_THUMB_TOUCH : S_NONE;
+    if (ID("thumb_meta") || ID("thumb_fb")) return S_THUMB_NEAR;
+    if (ID("menu")) return hand && !(flags & P_FACE) ? S_UPPER : S_MENU;   // Touch has no right menu button: B
+    if (ID("system")) return S_SYSTEM;
+    if (ID("pinch_ext") || ID("aim_activate_ext")) return C("pose") ? S_PINCH_POSE : C("ready_ext") ? S_PINCH_READY : S_TRIGGER;
+    if (ID("grasp_ext")) return C("ready_ext") ? S_GRASP_READY : S_GRASP;
+    if (ID("poke_ext")) return S_POKE_POSE;
+    if (ID("aim")) return S_AIM;
+    if (ID("grip") || ID("palm_ext") || ID("grip_surface")) return C("pose") ? S_GRIP : S_SQUEEZE;
+    return S_NONE;
+    #undef ID
+    #undef C
 }
-static int is_pose_comp(const char *c) { return !strcmp(c, "grip/pose") || !strcmp(c, "aim/pose") || !strcmp(c, "palm_ext/pose") || !strcmp(c, "grip_surface/pose"); }
-static int parse_binding(const char *path, Binding *b) {   // "/user/hand/left/input/trigger/value"
-    if (!strncmp(path, "/user/hand/left/", 16)) b->hand = 0;
-    else if (!strncmp(path, "/user/hand/right/", 17)) b->hand = 1;
+static int parse_binding(const char *path, int *hand, const char **comp, int *output) {   // "/user/hand/left/input/trigger/value"
+    if (!strncmp(path, "/user/hand/left/", 16)) *hand = 0;
+    else if (!strncmp(path, "/user/hand/right/", 17)) *hand = 1;
     else return 0;
-    const char *c = strstr(path, "/input/");
-    if (c) c += 7; else if ((c = strstr(path, "/output/"))) c += 8; else return 0;
-    snprintf(b->comp, sizeof b->comp, "%s", c);
-    return 1;
+    const char *c = path + (*hand ? 17 : 16);
+    if (!strncmp(c, "input/", 6)) { *comp = c + 6; *output = 0; return 1; }
+    if (!strncmp(c, "output/", 7)) { *comp = c + 7; *output = 1; return 1; }
+    return 0;
 }
-static int sub_matches(XrPath sub, int hand) {
-    if (sub == XR_NULL_PATH) return 1;
-    return !strcmp(pstr(sub), hand ? "/user/hand/right" : "/user/hand/left");
+static int sub_matches(XrPath sub, int hand) { return sub == XR_NULL_PATH || sub == handPath[hand]; }
+static int in_use(const Session *s, const Binding *b) { return b->hi == s->handHi[b->hand]; }   // the hand's current profile
+
+// tracked hands: raw joint geometry (metres, independent of world scale)
+static float jdist(int h, int a, int b) {
+    const VR4Pose *p = &joints[h].joint[a], *q = &joints[h].joint[b];
+    return vlen((V){p->px - q->px, p->py - q->py, p->pz - q->pz});
 }
-static XrPosef hand_pose(int hand, const char *comp, int *valid) {
+static float pinch_strength(int h, int tip) { return clamp01((0.07f - jdist(h, XR_HAND_JOINT_THUMB_TIP_EXT, tip)) / 0.05f); }   // open 7 cm .. closed 2 cm
+static float grasp(int h) {   // middle/ring/little fingertips curled onto the palm
+    float d = (jdist(h, 15, 0) + jdist(h, 20, 0) + jdist(h, 25, 0)) / 3;
+    return clamp01((0.085f - d) / 0.04f);
+}
+static int hand_tracked(int h) { return joints[h].tracked && (track.hand[h].flags & VR4_HAND_TRACKED); }
+
+static float src_value(int hand, int s) {
+    const VR4Hand *h = &track.hand[hand];
+    uint32_t b = h->buttons, lower = hand ? VR4_BTN_A : VR4_BTN_X, upper = hand ? VR4_BTN_B : VR4_BTN_Y;
+    switch (s) {
+        case S_TRIGGER: return h->trigger;
+        case S_TRIGGER_CLICK: return h->trigger > 0.5f;
+        case S_TRIGGER_TOUCH: return (b & VR4_BTN_TRIGGER_TOUCH) || h->trigger > 0.05f;
+        case S_SQUEEZE: return h->squeeze;
+        case S_SQUEEZE_CLICK: return h->squeeze > 0.5f;
+        case S_STICK_X: return h->stick_x;
+        case S_STICK_Y: return h->stick_y;
+        case S_STICK_CLICK: return (b & VR4_BTN_STICK_CLICK) != 0;
+        case S_STICK_TOUCH: return (b & (VR4_BTN_STICK_TOUCH | VR4_BTN_STICK_CLICK)) != 0;
+        case S_THUMB_TOUCH: return (b & VR4_BTN_THUMB_TOUCH) != 0;
+        case S_THUMB_NEAR: return (b & (VR4_BTN_THUMB_TOUCH | VR4_BTN_STICK_TOUCH)) != 0;
+        case S_LOWER: return (b & lower) != 0;
+        case S_UPPER: return (b & upper) != 0;
+        case S_MENU: return (b & VR4_BTN_MENU) != 0;
+        case S_SYSTEM: return !hand && (b & VR4_BTN_MENU);
+        case S_PAD_CLICK: return (b & (VR4_BTN_STICK_CLICK | lower)) != 0;
+        case S_PINCH_READY: return hand_tracked(hand) ? (h->flags & VR4_HAND_PINCH_READY) != 0 : (h->flags & VR4_HAND_ACTIVE) != 0;
+        case S_GRASP: return hand_tracked(hand) ? grasp(hand) : h->squeeze;
+        case S_GRASP_READY: return (h->flags & VR4_HAND_ACTIVE) != 0;
+    }
+    return 0;
+}
+static XrPosef hand_pose(int hand, int src, int *valid) {
     const VR4Hand *h = &track.hand[hand];
     *valid = (h->flags & VR4_HAND_POSE_VALID) != 0;
-    return xp(!strcmp(comp, "aim/pose") ? h->aim : h->grip);
+    if (hand_tracked(hand) && src == S_POKE_POSE) return xp(joints[hand].joint[XR_HAND_JOINT_INDEX_TIP_EXT]);
+    if (hand_tracked(hand) && src == S_PINCH_POSE) {   // between thumb and index tips, pointing along the aim ray
+        XrPosef p = xp(h->aim), a = xp(joints[hand].joint[XR_HAND_JOINT_THUMB_TIP_EXT]), b = xp(joints[hand].joint[XR_HAND_JOINT_INDEX_TIP_EXT]);
+        p.position = vscale(vadd(a.position, b.position), 0.5f);
+        return p;
+    }
+    return xp(src == S_GRIP ? h->grip : h->aim);
 }
 
 // ---------------------------------------------------------------- spaces
@@ -200,27 +338,8 @@ static void update_velocities(const VR4Tracking *t) {
     if (!t || t->time_ns == 0) return;
     for (int slot = 0; slot < TRACK_SLOT_COUNT; slot++) {
         VelocityTracker *vt = &velTrackers[slot];
-        int slotValid = 0;
-        VR4Pose rawPose = {0};
-        switch (slot) {
-            case TRACK_SLOT_HEAD:
-                rawPose = t->head;
-                slotValid = 1;
-                break;
-            case TRACK_SLOT_HAND_LEFT_AIM:
-                if (t->hand[0].flags & VR4_HAND_POSE_VALID) { rawPose = t->hand[0].aim; slotValid = 1; }
-                break;
-            case TRACK_SLOT_HAND_LEFT_GRIP:
-                if (t->hand[0].flags & VR4_HAND_POSE_VALID) { rawPose = t->hand[0].grip; slotValid = 1; }
-                break;
-            case TRACK_SLOT_HAND_RIGHT_AIM:
-                if (t->hand[1].flags & VR4_HAND_POSE_VALID) { rawPose = t->hand[1].aim; slotValid = 1; }
-                break;
-            case TRACK_SLOT_HAND_RIGHT_GRIP:
-                if (t->hand[1].flags & VR4_HAND_POSE_VALID) { rawPose = t->hand[1].grip; slotValid = 1; }
-                break;
-            default: break;
-        }
+        int h = (slot - 1) / 2, slotValid = slot == TRACK_SLOT_HEAD || (t->hand[h].flags & VR4_HAND_POSE_VALID);
+        VR4Pose rawPose = slot == TRACK_SLOT_HEAD ? t->head : slot % 2 ? t->hand[h].aim : t->hand[h].grip;
         if (!slotValid) {
             vt->valid = 0;
             vt->lastTimeNs = 0;
@@ -232,38 +351,11 @@ static void update_velocities(const VR4Tracking *t) {
         if (vt->valid && vt->lastTimeNs > 0 && t->time_ns > vt->lastTimeNs) {
             double dt = (double)(t->time_ns - vt->lastTimeNs) * 1e-9;
             if (dt >= 0.002 && dt <= 0.15) {
-                V instLinear = {
-                    (p.position.x - vt->lastPose.position.x) / (float)dt,
-                    (p.position.y - vt->lastPose.position.y) / (float)dt,
-                    (p.position.z - vt->lastPose.position.z) / (float)dt
-                };
-                Q qrel = qmul(p.orientation, qconj(vt->lastPose.orientation));
-                if (qrel.w < 0.0f) qrel = (Q){-qrel.x, -qrel.y, -qrel.z, -qrel.w};
-                if (qrel.w > 1.0f) qrel.w = 1.0f;
-                float angle = 2.0f * acosf(qrel.w);
-                float sinHalf = sqrtf(fmaxf(0.0f, 1.0f - qrel.w * qrel.w));
-                V instAngular = {0, 0, 0};
-                if (sinHalf > 1e-4f && angle > 1e-4f) {
-                    float factor = (angle / (float)dt) / sinHalf;
-                    instAngular = (V){qrel.x * factor, qrel.y * factor, qrel.z * factor};
-                }
-                float vMag = sqrtf(instLinear.x * instLinear.x + instLinear.y * instLinear.y + instLinear.z * instLinear.z);
-                if (vMag > 40.0f) {
-                    float s = 40.0f / vMag;
-                    instLinear = (V){instLinear.x * s, instLinear.y * s, instLinear.z * s};
-                }
-                float wMag = sqrtf(instAngular.x * instAngular.x + instAngular.y * instAngular.y + instAngular.z * instAngular.z);
-                if (wMag > 100.0f) {
-                    float s = 100.0f / wMag;
-                    instAngular = (V){instAngular.x * s, instAngular.y * s, instAngular.z * s};
-                }
+                V instLinear, instAngular;
+                pose_velocity(vt->lastPose, p, (float)dt, &instLinear, &instAngular);
                 if (vt->linearVel.x != 0 || vt->linearVel.y != 0 || vt->linearVel.z != 0) {
-                    vt->linearVel.x = 0.75f * instLinear.x + 0.25f * vt->linearVel.x;
-                    vt->linearVel.y = 0.75f * instLinear.y + 0.25f * vt->linearVel.y;
-                    vt->linearVel.z = 0.75f * instLinear.z + 0.25f * vt->linearVel.z;
-                    vt->angularVel.x = 0.75f * instAngular.x + 0.25f * vt->angularVel.x;
-                    vt->angularVel.y = 0.75f * instAngular.y + 0.25f * vt->angularVel.y;
-                    vt->angularVel.z = 0.75f * instAngular.z + 0.25f * vt->angularVel.z;
+                    vt->linearVel = vadd(vscale(instLinear, 0.75f), vscale(vt->linearVel, 0.25f));
+                    vt->angularVel = vadd(vscale(instAngular, 0.75f), vscale(vt->angularVel, 0.25f));
                 } else {
                     vt->linearVel = instLinear;
                     vt->angularVel = instAngular;
@@ -284,10 +376,11 @@ static XrPosef current_local_origin(const Session *s) {
     return o;
 }
 
-static XrPosef space_in_stage(Space *s, int *valid) {
+/// Pose of a space in stage space; VIEW follows the head of `ft` (the frame being located or composited).
+static XrPosef space_in_stage_at(Space *s, const VR4Tracking *ft, int *valid) {
     *valid = 1;
     if (s->ref) switch (s->type) {
-        case XR_REFERENCE_SPACE_TYPE_VIEW: return pmul(xp(frameTrack.head), s->offset);
+        case XR_REFERENCE_SPACE_TYPE_VIEW: return pmul(xp(ft->head), s->offset);
         case XR_REFERENCE_SPACE_TYPE_LOCAL: return pmul(current_local_origin((Session *)s->session), s->offset);
         case XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR: {
             XrPosef o = current_local_origin((Session *)s->session); o.position.y = 0; return pmul(o, s->offset);
@@ -296,11 +389,13 @@ static XrPosef space_in_stage(Space *s, int *valid) {
     }
     for (int i = 0; i < s->action->nb; i++) {
         Binding *b = &s->action->b[i];
-        if (is_pose_comp(b->comp) && sub_matches(s->sub, b->hand)) return pmul(hand_pose(b->hand, b->comp, valid), s->offset);
+        if (IS_POSE(b->src) && in_use((Session *)s->session, b) && sub_matches(s->sub, b->hand))
+            return pmul(hand_pose(b->hand, b->src, valid), s->offset);
     }
     *valid = 0;
     return IDENT;
 }
+static XrPosef space_in_stage(Space *s, int *valid) { return space_in_stage_at(s, frame_for(0), valid); }
 
 static void space_velocity_in_stage(Space *s, V *outLinear, V *outAngular, int *valid) {
     *valid = 1;
@@ -318,7 +413,7 @@ static void space_velocity_in_stage(Space *s, V *outLinear, V *outAngular, int *
                 VelocityTracker *vt = &velTrackers[TRACK_SLOT_HEAD];
                 *valid = vt->valid;
                 if (!vt->valid) return;
-                XrPosef headPose = xp(frameTrack.head);
+                XrPosef headPose = xp(frame_for(0)->head);
                 V r = qrot(headPose.orientation, s->offset.position);
                 *outLinear = vadd(vt->linearVel, vcross(vt->angularVel, r));
                 *outAngular = vt->angularVel;
@@ -331,15 +426,12 @@ static void space_velocity_in_stage(Space *s, V *outLinear, V *outAngular, int *
     }
     for (int i = 0; i < s->action->nb; i++) {
         Binding *b = &s->action->b[i];
-        if (is_pose_comp(b->comp) && sub_matches(s->sub, b->hand)) {
-            int isAim = !strcmp(b->comp, "aim/pose");
-            TrackSlot slot = (b->hand == 0) ? (isAim ? TRACK_SLOT_HAND_LEFT_AIM : TRACK_SLOT_HAND_LEFT_GRIP)
-                                            : (isAim ? TRACK_SLOT_HAND_RIGHT_AIM : TRACK_SLOT_HAND_RIGHT_GRIP);
-            VelocityTracker *vt = &velTrackers[slot];
+        if (IS_POSE(b->src) && in_use((Session *)s->session, b) && sub_matches(s->sub, b->hand)) {
+            VelocityTracker *vt = &velTrackers[1 + 2 * b->hand + (b->src == S_GRIP)];
             *valid = vt->valid;
             if (!vt->valid) return;
             int hvalid;
-            XrPosef hp = hand_pose(b->hand, b->comp, &hvalid);
+            XrPosef hp = hand_pose(b->hand, b->src, &hvalid);
             if (!hvalid) { *valid = 0; return; }
             V r = qrot(hp.orientation, s->offset.position);
             *outLinear = vadd(vt->linearVel, vcross(vt->angularVel, r));
@@ -369,19 +461,37 @@ static void set_local_origin(Session *s) {   // LOCAL = head position at start, 
     for (uint32_t i_ = 0; i_ < (n); i_++) { __VA_ARGS__; } } while (0)
 
 // Compatibility: games refuse to start or wait forever without some of these (BONELAB blocks on XR_FB_display_refresh_rate).
-// Depth / cylinder layers are accepted and ignored; the visibility mask is empty; LOCAL_FLOOR is the local origin on the floor.
-static const char *exts[] = {XR_KHR_D3D11_ENABLE_EXTENSION_NAME, XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME,
-                             XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME,
-                             XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME, XR_KHR_VISIBILITY_MASK_EXTENSION_NAME,
-                             XR_EXT_LOCAL_FLOOR_EXTENSION_NAME, XR_FB_COLOR_SPACE_EXTENSION_NAME,
-                             XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME,
-                             XR_EXT_DEBUG_UTILS_EXTENSION_NAME};   // no XR_EXT_palm_pose: we only have grip/aim, and a fake palm (= grip) made OpenComposite rotate/shift the hands
-static const uint32_t extVer[] = {XR_KHR_D3D11_enable_SPEC_VERSION, XR_KHR_win32_convert_performance_counter_time_SPEC_VERSION,
-                                  XR_FB_display_refresh_rate_SPEC_VERSION, XR_KHR_composition_layer_depth_SPEC_VERSION,
-                                  XR_KHR_composition_layer_cylinder_SPEC_VERSION, XR_KHR_visibility_mask_SPEC_VERSION,
-                                  XR_EXT_local_floor_SPEC_VERSION, XR_FB_color_space_SPEC_VERSION,
-                                  XR_KHR_composition_layer_color_scale_bias_SPEC_VERSION,
-                                  XR_EXT_debug_utils_SPEC_VERSION};
+// Depth layers are accepted and ignored; LOCAL_FLOOR is the local origin on the floor. The controller-profile
+// extensions only unlock their interaction profiles (fed from Touch); the performance settings are hints.
+#define EXTS(_) \
+    _(XR_KHR_D3D11_enable, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) \
+    _(XR_KHR_D3D12_enable, XR_KHR_D3D12_ENABLE_EXTENSION_NAME) \
+    _(XR_KHR_win32_convert_performance_counter_time, XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME) \
+    _(XR_FB_display_refresh_rate, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME) \
+    _(XR_KHR_composition_layer_depth, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME) \
+    _(XR_KHR_composition_layer_cylinder, XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME) \
+    _(XR_KHR_visibility_mask, XR_KHR_VISIBILITY_MASK_EXTENSION_NAME) \
+    _(XR_EXT_local_floor, XR_EXT_LOCAL_FLOOR_EXTENSION_NAME) \
+    _(XR_FB_color_space, XR_FB_COLOR_SPACE_EXTENSION_NAME) \
+    _(XR_KHR_composition_layer_color_scale_bias, XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME) \
+    _(XR_EXT_debug_utils, XR_EXT_DEBUG_UTILS_EXTENSION_NAME) \
+    _(XR_EXT_hand_tracking, XR_EXT_HAND_TRACKING_EXTENSION_NAME) \
+    _(XR_EXT_hand_joints_motion_range, XR_EXT_HAND_JOINTS_MOTION_RANGE_EXTENSION_NAME) \
+    _(XR_EXT_hand_tracking_data_source, XR_EXT_HAND_TRACKING_DATA_SOURCE_EXTENSION_NAME) \
+    _(XR_FB_hand_tracking_aim, XR_FB_HAND_TRACKING_AIM_EXTENSION_NAME) \
+    _(XR_EXT_hand_interaction, XR_EXT_HAND_INTERACTION_EXTENSION_NAME) \
+    _(XR_META_touch_controller_plus, XR_META_TOUCH_CONTROLLER_PLUS_EXTENSION_NAME) \
+    _(XR_FB_touch_controller_pro, XR_FB_TOUCH_CONTROLLER_PRO_EXTENSION_NAME) \
+    _(XR_FB_touch_controller_proximity, XR_FB_TOUCH_CONTROLLER_PROXIMITY_EXTENSION_NAME) \
+    _(XR_EXT_hp_mixed_reality_controller, XR_EXT_HP_MIXED_REALITY_CONTROLLER_EXTENSION_NAME) \
+    _(XR_HTC_vive_cosmos_controller_interaction, XR_HTC_VIVE_COSMOS_CONTROLLER_INTERACTION_EXTENSION_NAME) \
+    _(XR_EXT_performance_settings, XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME) \
+    _(XR_KHR_locate_spaces, XR_KHR_LOCATE_SPACES_EXTENSION_NAME)
+// no XR_EXT_palm_pose: we only have grip/aim, and a fake palm (= grip) made OpenComposite rotate/shift the hands
+#define EXT_NAME(id, name) name,
+#define EXT_VER(id, name) id##_SPEC_VERSION,
+static const char *exts[] = {EXTS(EXT_NAME)};
+static const uint32_t extVer[] = {EXTS(EXT_VER)};
 #define NEXTS (sizeof exts / sizeof *exts)
 
 static XrResult XRAPI_CALL xrEnumerateApiLayerProperties_(uint32_t cap, uint32_t *n, XrApiLayerProperties *p) { (void)cap; (void)p; *n = 0; return XR_SUCCESS; }
@@ -392,28 +502,33 @@ static XrResult XRAPI_CALL xrEnumerateInstanceExtensionProperties_(const char *l
 }
 
 static XrResult XRAPI_CALL xrCreateInstance_(const XrInstanceCreateInfo *ci, XrInstance *out) {
+    char req[1024] = "";
     for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) {
         int ok = 0;
         for (size_t j = 0; j < NEXTS; j++) ok |= !strcmp(ci->enabledExtensionNames[i], exts[j]);
-        if (!ok) { logmsg("unsupported extension %s", ci->enabledExtensionNames[i]); return XR_ERROR_EXTENSION_NOT_PRESENT; }
+        if (!ok) { logmsg("game requires %s, which WineXR does not implement", ci->enabledExtensionNames[i]); return XR_ERROR_EXTENSION_NOT_PRESENT; }
+        if (strlen(req) + strlen(ci->enabledExtensionNames[i]) + 2 < sizeof req) strcat(strcat(req, " "), ci->enabledExtensionNames[i]);
     }
     if (!shm) {
-        HANDLE f = CreateFileA(VR4_SHM_PATH_WIN, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-        if (f == INVALID_HANDLE_VALUE) { logmsg("VR4Mac app not running (no %s)", VR4_SHM_PATH_WIN); return XR_ERROR_RUNTIME_UNAVAILABLE; }
+        init_paths();
+        HANDLE f = CreateFileA(shmPath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (f == INVALID_HANDLE_VALUE) { logmsg("VR4Mac app not running (no %s)", shmPath); return XR_ERROR_RUNTIME_UNAVAILABLE; }
         HANDLE m = CreateFileMappingA(f, NULL, PAGE_READWRITE, 0, VR4_SHM_SIZE, NULL);
         shm = m ? (VR4Shm *)MapViewOfFile(m, FILE_MAP_ALL_ACCESS, 0, 0, VR4_SHM_SIZE) : NULL;
         if (!shm || shm->magic != VR4_SHM_MAGIC || shm->version != VR4_SHM_VERSION) { logmsg("bad shared memory"); shm = NULL; return XR_ERROR_RUNTIME_UNAVAILABLE; }
     }
     QueryPerformanceFrequency(&qpf);
+    handPath[0] = intern("/user/hand/left"); handPath[1] = intern("/user/hand/right");
     snprintf(appName, sizeof appName, "%s", ci->applicationInfo.applicationName);
     snprintf(shm->app_name, sizeof shm->app_name, "%s", appName);
-    logmsg("xrCreateInstance app=%s engine=%s", ci->applicationInfo.applicationName, ci->applicationInfo.engineName);
+    logmsg("xrCreateInstance app=%s engine=%s api %u.%u, extensions:%s", ci->applicationInfo.applicationName, ci->applicationInfo.engineName,
+           XR_VERSION_MAJOR(ci->applicationInfo.apiVersion), XR_VERSION_MINOR(ci->applicationInfo.apiVersion), req);
     *out = (XrInstance)(uintptr_t)1;
     return XR_SUCCESS;
 }
-static XrResult XRAPI_CALL xrDestroyInstance_(XrInstance i) { (void)i; return XR_SUCCESS; }
+static XrResult XRAPI_CALL xrDestroyInstance_(XrInstance i) { (void)i; nsugg = 0; return XR_SUCCESS; }   // suggestions are per instance
 static XrResult XRAPI_CALL xrGetInstanceProperties_(XrInstance i, XrInstanceProperties *p) {
-    (void)i; p->runtimeVersion = XR_MAKE_VERSION(0, 2, 0); strcpy(p->runtimeName, "VR4Mac"); return XR_SUCCESS;
+    (void)i; p->runtimeVersion = XR_MAKE_VERSION(1, 1, 0); strcpy(p->runtimeName, "VR4Mac"); return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrPollEvent_(XrInstance i, XrEventDataBuffer *e) {
     (void)i;
@@ -466,9 +581,8 @@ static XrResult XRAPI_CALL xrGetSystemProperties_(XrInstance i, XrSystemId id, X
     p->graphicsProperties.maxLayerCount = XR_MIN_COMPOSITION_LAYERS_SUPPORTED;
     p->trackingProperties.orientationTracking = XR_TRUE; p->trackingProperties.positionTracking = XR_TRUE;
     for (XrBaseOutStructure *next = (XrBaseOutStructure *)p->next; next; next = next->next) {
-        if (next->type == XR_TYPE_SYSTEM_COLOR_SPACE_PROPERTIES_FB) {
-            ((XrSystemColorSpacePropertiesFB *)next)->colorSpace = XR_COLOR_SPACE_QUEST_FB;
-        }
+        if (next->type == XR_TYPE_SYSTEM_COLOR_SPACE_PROPERTIES_FB) ((XrSystemColorSpacePropertiesFB *)next)->colorSpace = XR_COLOR_SPACE_QUEST_FB;
+        if (next->type == XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT) ((XrSystemHandTrackingPropertiesEXT *)next)->supportsHandTracking = XR_TRUE;
     }
     return XR_SUCCESS;
 }
@@ -506,19 +620,22 @@ static XrResult XRAPI_CALL xrEnumerateViewConfigurationViews_(XrInstance i, XrSy
         v[i_].recommendedSwapchainSampleCount = 1; v[i_].maxSwapchainSampleCount = 1; });
     return XR_SUCCESS;
 }
-static XrResult XRAPI_CALL xrGetD3D11GraphicsRequirementsKHR_(XrInstance i, XrSystemId id, XrGraphicsRequirementsD3D11KHR *r) {
-    (void)i; (void)id;
-    IDXGIFactory1 *f; IDXGIAdapter1 *a; DXGI_ADAPTER_DESC1 d;
-    memset(&r->adapterLuid, 0, sizeof r->adapterLuid);
+static LUID adapter_luid(void) {   // the first (only) GPU
+    IDXGIFactory1 *f; IDXGIAdapter1 *a; DXGI_ADAPTER_DESC1 d; LUID l = {0, 0};
     if (SUCCEEDED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f))) {
         if (SUCCEEDED(IDXGIFactory1_EnumAdapters1(f, 0, &a))) {
-            if (SUCCEEDED(IDXGIAdapter1_GetDesc1(a, &d))) r->adapterLuid = d.AdapterLuid;
+            if (SUCCEEDED(IDXGIAdapter1_GetDesc1(a, &d))) l = d.AdapterLuid;
             IDXGIAdapter1_Release(a);
         }
         IDXGIFactory1_Release(f);
     }
-    r->minFeatureLevel = D3D_FEATURE_LEVEL_11_0;
-    return XR_SUCCESS;
+    return l;
+}
+static XrResult XRAPI_CALL xrGetD3D11GraphicsRequirementsKHR_(XrInstance i, XrSystemId id, XrGraphicsRequirementsD3D11KHR *r) {
+    (void)i; (void)id; r->adapterLuid = adapter_luid(); r->minFeatureLevel = D3D_FEATURE_LEVEL_11_0; return XR_SUCCESS;
+}
+static XrResult XRAPI_CALL xrGetD3D12GraphicsRequirementsKHR_(XrInstance i, XrSystemId id, XrGraphicsRequirementsD3D12KHR *r) {
+    (void)i; (void)id; r->adapterLuid = adapter_luid(); r->minFeatureLevel = D3D_FEATURE_LEVEL_11_0; return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrConvertWin32PerformanceCounterToTimeKHR_(XrInstance i, const LARGE_INTEGER *c, XrTime *t) {
     (void)i; *t = (XrTime)((double)c->QuadPart * 1e9 / (double)qpf.QuadPart) + qpcOffsetNs; return XR_SUCCESS;
@@ -530,13 +647,29 @@ static XrResult XRAPI_CALL xrConvertTimeToWin32PerformanceCounterKHR_(XrInstance
 // ---------------------------------------------------------------- session
 static XrResult XRAPI_CALL xrCreateSession_(XrInstance i, const XrSessionCreateInfo *ci, XrSession *out) {
     (void)i;
-    const XrGraphicsBindingD3D11KHR *gb = NULL;
-    for (const XrBaseInStructure *b = ci->next; b; b = b->next)
+    const XrGraphicsBindingD3D11KHR *gb = NULL; const XrGraphicsBindingD3D12KHR *gb12 = NULL;
+    for (const XrBaseInStructure *b = ci->next; b; b = b->next) {
         if (b->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) gb = (const XrGraphicsBindingD3D11KHR *)b;
-    if (!gb || !gb->device) { logmsg("xrCreateSession: only D3D11 is supported"); return XR_ERROR_GRAPHICS_DEVICE_INVALID; }
+        if (b->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR) gb12 = (const XrGraphicsBindingD3D12KHR *)b;
+    }
+    if ((!gb || !gb->device) && (!gb12 || !gb12->device || !gb12->queue)) {
+        char name[XR_MAX_STRUCTURE_NAME_SIZE] = "no graphics binding";
+        if (ci->next) xrStructureTypeToString_(XR_NULL_HANDLE, ((const XrBaseInStructure *)ci->next)->type, name);
+        logmsg("xrCreateSession: the game renders with %s; WineXR supports D3D11 and D3D12", name);
+        return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+    }
     Session *s = calloc(1, sizeof *s);
-    s->dev = gb->device; ID3D11Device_AddRef(s->dev);
-    ID3D11Device_GetImmediateContext(s->dev, &s->ctx);
+    if (gb && gb->device) { s->dev = gb->device; ID3D11Device_AddRef(s->dev); ID3D11Device_GetImmediateContext(s->dev, &s->ctx); }
+    else {
+        s->dev12 = gb12->device; ID3D12Device_AddRef(s->dev12); s->queue = gb12->queue; ID3D12CommandQueue_AddRef(s->queue);
+        int ok = SUCCEEDED(ID3D12Device_CreateFence(s->dev12, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&s->fence));
+        for (int k = 0; ok && k < NSTAGE; k++)
+            ok = SUCCEEDED(ID3D12Device_CreateCommandAllocator(s->dev12, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&s->alloc[k])) &&
+                 SUCCEEDED(ID3D12Device_CreateCommandList(s->dev12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, s->alloc[k], NULL, &IID_ID3D12GraphicsCommandList, (void **)&s->cl[k])) &&
+                 SUCCEEDED(ID3D12GraphicsCommandList_Close(s->cl[k]));
+        s->fenceEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (!ok) { logmsg("xrCreateSession: D3D12 readback setup failed"); rel(s->fence); s->fence = NULL; }
+    }
     read_tracking(); frameTrack = track; set_local_origin(s);
     theSession = s;
     *out = (XrSession)s;
@@ -544,13 +677,19 @@ static XrResult XRAPI_CALL xrCreateSession_(XrInstance i, const XrSessionCreateI
     logmsg("xrCreateSession ok, eye %ux%u", eye_w(), eye_h());
     return XR_SUCCESS;
 }
+static void wait_gpu12(Session *s, uint64_t v) {   // until the game's queue has passed our signal `v`
+    if (s->fence && ID3D12Fence_GetCompletedValue(s->fence) < v && SUCCEEDED(ID3D12Fence_SetEventOnCompletion(s->fence, v, s->fenceEvent)))
+        WaitForSingleObject(s->fenceEvent, 1000);
+}
 static XrResult XRAPI_CALL xrDestroySession_(XrSession h) {
     Session *s = (Session *)h;
-    for (int k = 0; k < NSTAGE; k++)
-        for (int i = 0; i < 2; i++)
-            if (s->staging[k][i]) ID3D11Texture2D_Release(s->staging[k][i]);
-    if (s->fallback) ID3D11Texture2D_Release(s->fallback);
-    ID3D11DeviceContext_Release(s->ctx); ID3D11Device_Release(s->dev);
+    wait_gpu12(s, s->fenceValue);
+    for (int k = 0; k < NSTAGE; k++) { rel(s->alloc[k]); rel(s->cl[k]); rel(s->rb[k]); }
+    rel(s->fence); rel(s->queue); rel(s->dev12);
+    if (s->fenceEvent) CloseHandle(s->fenceEvent);
+    for (int k = 0; k < NSTAGE; k++) rel(s->staging[k]);
+    rel(s->vs); rel(s->ps); rel(s->il); rel(s->vb); rel(s->cb); rel(s->smp); rel(s->blend[0]); rel(s->blend[1]); rel(s->rs);
+    rel(s->rtv); rel(s->target); rel(s->ctx); rel(s->dev);
     if (theSession == s) theSession = NULL;
     free(s);
     return XR_SUCCESS;
@@ -585,7 +724,7 @@ static XrResult XRAPI_CALL xrEnumerateReferenceSpaces_(XrSession h, uint32_t cap
 static XrResult XRAPI_CALL xrCreateReferenceSpace_(XrSession h, const XrReferenceSpaceCreateInfo *ci, XrSpace *out) {
     if (ci->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_VIEW && ci->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_LOCAL &&
         ci->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_STAGE && ci->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR) {
-        logmsg("reference space %d unsupported", ci->referenceSpaceType); return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
+        logonce("reference space %d unsupported", ci->referenceSpaceType); return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
     }
     Space *s = calloc(1, sizeof *s);
     s->session = h; s->ref = 1; s->type = ci->referenceSpaceType; s->offset = ci->poseInReferenceSpace;
@@ -632,6 +771,21 @@ static XrResult XRAPI_CALL xrLocateSpace_(XrSpace sp, XrSpace base, XrTime t, Xr
         }
     return XR_SUCCESS;
 }
+static XrResult XRAPI_CALL xrLocateSpaces_(XrSession h, const XrSpacesLocateInfo *li, XrSpaceLocations *out) {   // XR_KHR_locate_spaces / 1.1
+    (void)h;
+    if (!li || !out || !out->locations || li->spaceCount != out->locationCount) return XR_ERROR_VALIDATION_FAILURE;
+    XrSpaceVelocities *vel = NULL;
+    for (XrBaseOutStructure *n = out->next; n; n = n->next) if (n->type == XR_TYPE_SPACE_VELOCITIES) vel = (XrSpaceVelocities *)n;
+    if (vel && (vel->velocityCount != li->spaceCount || !vel->velocities)) return XR_ERROR_VALIDATION_FAILURE;
+    for (uint32_t i = 0; i < li->spaceCount; i++) {
+        XrSpaceVelocity sv = {XR_TYPE_SPACE_VELOCITY}; XrSpaceLocation l = {XR_TYPE_SPACE_LOCATION, vel ? &sv : NULL};
+        XrResult r = xrLocateSpace_(li->spaces[i], li->baseSpace, li->time, &l);
+        if (XR_FAILED(r)) return r;
+        out->locations[i] = (XrSpaceLocationData){l.locationFlags, l.pose};
+        if (vel) vel->velocities[i] = (XrSpaceVelocityData){sv.velocityFlags, sv.linearVelocity, sv.angularVelocity};
+    }
+    return XR_SUCCESS;
+}
 static XrResult XRAPI_CALL xrDestroySpace_(XrSpace s) { free(s); return XR_SUCCESS; }
 
 // ---------------------------------------------------------------- frames
@@ -645,10 +799,13 @@ static XrResult XRAPI_CALL xrWaitFrame_(XrSession h, const XrFrameWaitInfo *wi, 
     // Pace the game to the headset: block until the next tracking sample, but never past one period (+2 ms jitter)
     // after the previous frame was released. The deadline used to be 2 periods from *now*, so stale tracking (headset
     // asleep while linked) stacked the full timeout on top of the game's own frame time: 6 ms game -> 29 fps.
+    // Spins only within 3 ms of when the next sample is due (one period after the last); sleeps otherwise (Sleep(1) is
+    // ~1 ms under Wine), so a quiet headset doesn't cost a busy core.
     int64_t deadline = (lastExit ? lastExit : start) + period + 2000000;
     while (!read_tracking()) {
-        if (qpc_ns() > deadline) break;
-        Sleep(0);
+        int64_t now = qpc_ns(), due = lastSampleNs + period;
+        if (now > deadline) break;
+        Sleep(lastSampleNs && now > due - 3000000 && now < due + 3000000 ? 0 : 1);
     }
     frameTrack = track;
     frameRing[frameRingN++ % 4] = track;
@@ -683,13 +840,12 @@ static XrResult XRAPI_CALL xrLocateViews_(XrSession h, const XrViewLocateInfo *l
     if (!li || !vs) return XR_ERROR_VALIDATION_FAILURE;
     if (!li->space) return XR_ERROR_HANDLE_INVALID;
     int valid;
-    XrPosef base = space_in_stage((Space *)li->space, &valid);
     const VR4Tracking *ft = frame_for(li->displayTime);
+    XrPosef base = space_in_stage_at((Space *)li->space, ft, &valid);
     vs->viewStateFlags = valid ? (XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT |
                                   XR_VIEW_STATE_ORIENTATION_TRACKED_BIT | XR_VIEW_STATE_POSITION_TRACKED_BIT) : 0;
     FILL_ARRAY(cap, n, views, 2, {
-        VR4Eye d = {{i_ ? 0.032f : -0.032f, 1.6f, 0, 0, 0, 0, 1}, {-0.8f, 0.8f, 0.8f, -0.8f}};   // no headset yet
-        const VR4Eye *e = ft->time_ns ? &ft->eye[i_] : &d;
+        const VR4Eye *e = &ft->eye[i_];
         views[i_].pose = pmul(pinv(base), xp(e->pose));
         views[i_].fov = (XrFovf){e->fov.left, e->fov.right, e->fov.up, e->fov.down};
     });
@@ -697,7 +853,267 @@ static XrResult XRAPI_CALL xrLocateViews_(XrSession h, const XrViewLocateInfo *l
 }
 
 static Swapchain *find_sc(XrSwapchain s) { return (Swapchain *)s; }
-static int is_rgba(DXGI_FORMAT f) { return f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || f == DXGI_FORMAT_R8G8B8A8_TYPELESS; }
+// Swapchain textures are typeless; 8-bit colour families are what the compositor reads (raw bytes, no sRGB conversion).
+static int is_rgba(DXGI_FORMAT f) { return f == DXGI_FORMAT_R8G8B8A8_TYPELESS; }
+static int is_color(DXGI_FORMAT f) { return f == DXGI_FORMAT_R8G8B8A8_TYPELESS || f == DXGI_FORMAT_B8G8R8A8_TYPELESS; }
+static DXGI_FORMAT unorm(DXGI_FORMAT f) { return is_rgba(f) ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM; }
+
+// ---------------------------------------------------------------- compositor
+// The first stereo projection is copied into a side-by-side target; quad and cylinder layers submitted after it are
+// drawn on top in order (anything before an opaque projection is hidden by it). Without a projection, the layers go
+// on black at their real place in the world. Clip-space vertices are built on the CPU, so the shaders stay trivial.
+static const char hlsl[] =
+    "Texture2D t : register(t0); SamplerState s : register(s0); cbuffer c : register(b0) { float4 scale, bias; };\n"
+    "void vs(float4 p : POSITION, float2 uv : TEXCOORD, out float4 o : SV_Position, out float2 ouv : TEXCOORD) { o = p; ouv = uv; }\n"
+    "float4 ps(float4 p : SV_Position, float2 uv : TEXCOORD) : SV_Target { return t.Sample(s, uv) * scale + bias; }\n";
+typedef struct { float x, y, z, w, u, v; } Vtx;
+#define CYL_SEGS 32
+#define MAXV (2 * (CYL_SEGS + 1))
+
+static int comp_init(Session *s) {
+    if (s->compOk) return s->compOk > 0;
+    s->compOk = -1;
+    HMODULE dc = LoadLibraryA("d3dcompiler_47.dll");
+    pD3DCompile compile = dc ? (pD3DCompile)(void *)GetProcAddress(dc, "D3DCompile") : NULL;
+    ID3DBlob *vsb = NULL, *psb = NULL, *err = NULL;
+    if (!compile || FAILED(compile(hlsl, sizeof hlsl - 1, "winexr", NULL, NULL, "vs", "vs_4_0", 0, 0, &vsb, &err)) ||
+        FAILED(compile(hlsl, sizeof hlsl - 1, "winexr", NULL, NULL, "ps", "ps_4_0", 0, 0, &psb, &err))) {
+        logmsg("layer compositor unavailable (%s): quad/cylinder layers are not shown", err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "no d3dcompiler_47");
+        rel(vsb); rel(psb); rel(err);
+        return 0;
+    }
+    D3D11_INPUT_ELEMENT_DESC ie[] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                     {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0}};
+    D3D11_BUFFER_DESC vbd = {MAXV * sizeof(Vtx), D3D11_USAGE_DYNAMIC, D3D11_BIND_VERTEX_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0};
+    D3D11_BUFFER_DESC cbd = {32, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0};
+    D3D11_SAMPLER_DESC sd = {D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP,
+                             0, 1, D3D11_COMPARISON_NEVER, {0, 0, 0, 0}, 0, D3D11_FLOAT32_MAX};
+    D3D11_RASTERIZER_DESC rd = {D3D11_FILL_SOLID, D3D11_CULL_NONE, FALSE, 0, 0, 0, TRUE, FALSE, FALSE, FALSE};
+    D3D11_BLEND_DESC bd = {FALSE, FALSE, {{TRUE, D3D11_BLEND_ONE, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_OP_ADD,   // premultiplied alpha
+                                           D3D11_BLEND_ONE, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_OP_ADD, D3D11_COLOR_WRITE_ENABLE_ALL}}};
+    ID3D11Device *d = s->dev;
+    const void *vsc = ID3D10Blob_GetBufferPointer(vsb); SIZE_T vsn = ID3D10Blob_GetBufferSize(vsb);
+    int ok = SUCCEEDED(ID3D11Device_CreateVertexShader(d, vsc, vsn, NULL, &s->vs)) &&
+             SUCCEEDED(ID3D11Device_CreatePixelShader(d, ID3D10Blob_GetBufferPointer(psb), ID3D10Blob_GetBufferSize(psb), NULL, &s->ps)) &&
+             SUCCEEDED(ID3D11Device_CreateInputLayout(d, ie, 2, vsc, vsn, &s->il)) &&
+             SUCCEEDED(ID3D11Device_CreateBuffer(d, &vbd, NULL, &s->vb)) && SUCCEEDED(ID3D11Device_CreateBuffer(d, &cbd, NULL, &s->cb)) &&
+             SUCCEEDED(ID3D11Device_CreateSamplerState(d, &sd, &s->smp)) && SUCCEEDED(ID3D11Device_CreateRasterizerState(d, &rd, &s->rs)) &&
+             SUCCEEDED(ID3D11Device_CreateBlendState(d, &bd, &s->blend[0]));
+    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;   // straight alpha (XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT)
+    ok = ok && SUCCEEDED(ID3D11Device_CreateBlendState(d, &bd, &s->blend[1]));
+    rel(vsb); rel(psb); rel(err);
+    if (!ok) { logmsg("layer compositor: D3D11 setup failed, quad/cylinder layers are not shown"); return 0; }
+    s->compOk = 1;
+    return 1;
+}
+
+typedef struct {   // the game's pipeline state the compositor touches, restored afterwards
+    ID3D11InputLayout *il; D3D11_PRIMITIVE_TOPOLOGY topo; ID3D11Buffer *vb, *pcb; UINT stride, off;
+    ID3D11VertexShader *vs; ID3D11HullShader *hs; ID3D11DomainShader *ds; ID3D11GeometryShader *gs; ID3D11PixelShader *ps;
+    ID3D11ShaderResourceView *srv; ID3D11SamplerState *smp; ID3D11RasterizerState *rs;
+    D3D11_VIEWPORT vp[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]; UINT nvp;
+    ID3D11RenderTargetView *rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]; ID3D11DepthStencilView *dsv;
+    ID3D11BlendState *bs; FLOAT bf[4]; UINT mask; ID3D11DepthStencilState *dss; UINT sref;
+} SavedState;
+static void save_state(ID3D11DeviceContext *c, SavedState *z) {
+    ID3D11DeviceContext_IAGetInputLayout(c, &z->il); ID3D11DeviceContext_IAGetPrimitiveTopology(c, &z->topo);
+    ID3D11DeviceContext_IAGetVertexBuffers(c, 0, 1, &z->vb, &z->stride, &z->off);
+    ID3D11DeviceContext_VSGetShader(c, &z->vs, NULL, NULL); ID3D11DeviceContext_HSGetShader(c, &z->hs, NULL, NULL);
+    ID3D11DeviceContext_DSGetShader(c, &z->ds, NULL, NULL); ID3D11DeviceContext_GSGetShader(c, &z->gs, NULL, NULL);
+    ID3D11DeviceContext_PSGetShader(c, &z->ps, NULL, NULL); ID3D11DeviceContext_PSGetConstantBuffers(c, 0, 1, &z->pcb);
+    ID3D11DeviceContext_PSGetShaderResources(c, 0, 1, &z->srv); ID3D11DeviceContext_PSGetSamplers(c, 0, 1, &z->smp);
+    ID3D11DeviceContext_RSGetState(c, &z->rs);
+    z->nvp = 0; ID3D11DeviceContext_RSGetViewports(c, &z->nvp, NULL); ID3D11DeviceContext_RSGetViewports(c, &z->nvp, z->vp);
+    ID3D11DeviceContext_OMGetRenderTargets(c, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, z->rtv, &z->dsv);
+    ID3D11DeviceContext_OMGetBlendState(c, &z->bs, z->bf, &z->mask); ID3D11DeviceContext_OMGetDepthStencilState(c, &z->dss, &z->sref);
+}
+static void restore_state(ID3D11DeviceContext *c, SavedState *z) {
+    ID3D11DeviceContext_IASetInputLayout(c, z->il); ID3D11DeviceContext_IASetPrimitiveTopology(c, z->topo);
+    ID3D11DeviceContext_IASetVertexBuffers(c, 0, 1, &z->vb, &z->stride, &z->off);
+    ID3D11DeviceContext_VSSetShader(c, z->vs, NULL, 0); ID3D11DeviceContext_HSSetShader(c, z->hs, NULL, 0);
+    ID3D11DeviceContext_DSSetShader(c, z->ds, NULL, 0); ID3D11DeviceContext_GSSetShader(c, z->gs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(c, z->ps, NULL, 0); ID3D11DeviceContext_PSSetConstantBuffers(c, 0, 1, &z->pcb);
+    ID3D11DeviceContext_PSSetShaderResources(c, 0, 1, &z->srv); ID3D11DeviceContext_PSSetSamplers(c, 0, 1, &z->smp);
+    ID3D11DeviceContext_RSSetState(c, z->rs); ID3D11DeviceContext_RSSetViewports(c, z->nvp, z->vp);
+    ID3D11DeviceContext_OMSetRenderTargets(c, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, z->rtv, z->dsv);
+    ID3D11DeviceContext_OMSetBlendState(c, z->bs, z->bf, z->mask); ID3D11DeviceContext_OMSetDepthStencilState(c, z->dss, z->sref);
+    rel(z->il); rel(z->vb); rel(z->pcb); rel(z->vs); rel(z->hs); rel(z->ds); rel(z->gs); rel(z->ps); rel(z->srv); rel(z->smp);
+    rel(z->rs); rel(z->dsv); rel(z->bs); rel(z->dss);
+    for (int i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++) rel(z->rtv[i]);
+}
+
+static int is_overlay(const XrCompositionLayerBaseHeader *l) {
+    return l && (l->type == XR_TYPE_COMPOSITION_LAYER_QUAD || l->type == XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR);
+}
+/// Draws one quad or cylinder layer into both eyes of the bound side-by-side target (each eye `w` x `h`).
+static void draw_layer(Session *s, const XrCompositionLayerBaseHeader *L, const VR4Tracking *ft, const XrPosef eye[2], const XrFovf fov[2], uint32_t w, uint32_t h) {
+    const XrSwapchainSubImage *si; XrSpace space; XrPosef pose; XrEyeVisibility vis; Vtx loc[MAXV]; int nv = 0;
+    if (L->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {   // in the pose's XY plane, facing +Z
+        const XrCompositionLayerQuad *q = (const XrCompositionLayerQuad *)L;
+        si = &q->subImage; space = q->space; pose = q->pose; vis = q->eyeVisibility;
+        float x = q->size.width / 2, y = q->size.height / 2;
+        loc[0] = (Vtx){-x, y, 0, 1, 0, 0}; loc[1] = (Vtx){x, y, 0, 1, 1, 0}; loc[2] = (Vtx){-x, -y, 0, 1, 0, 1}; loc[3] = (Vtx){x, -y, 0, 1, 1, 1};
+        nv = 4;
+    } else {   // cylinder: an arc around the pose's Y axis, centred on -Z, seen from inside
+        const XrCompositionLayerCylinderKHR *c = (const XrCompositionLayerCylinderKHR *)L;
+        si = &c->subImage; space = c->space; pose = c->pose; vis = c->eyeVisibility;
+        if (!(c->radius > 0) || isinf(c->radius) || !(c->centralAngle > 0) || !(c->aspectRatio > 0)) {
+            logonce("cylinder layer radius %g angle %g aspect %g not drawn", c->radius, c->centralAngle, c->aspectRatio); return;
+        }
+        float half = c->radius * c->centralAngle / c->aspectRatio / 2;
+        for (int i = 0; i <= CYL_SEGS; i++) {
+            float f = (float)i / CYL_SEGS, a = (f - 0.5f) * c->centralAngle, x = c->radius * sinf(a), z = -c->radius * cosf(a);
+            loc[nv++] = (Vtx){x, half, z, 1, f, 0}; loc[nv++] = (Vtx){x, -half, z, 1, f, 1};
+        }
+    }
+    Swapchain *sc = find_sc(si->swapchain);
+    if (!sc || sc->released < 0 || si->imageArrayIndex >= sc->array || !is_color(sc->fmt)) return;
+    float u0 = (float)si->imageRect.offset.x / sc->w, v0 = (float)si->imageRect.offset.y / sc->h;
+    float du = (float)si->imageRect.extent.width / sc->w, dv = (float)si->imageRect.extent.height / sc->h;
+    if (!space) return;
+    int valid; XrPosef world = pmul(space_in_stage_at((Space *)space, ft, &valid), pose);
+    if (!valid) return;
+    float cb[8] = {1, 1, 1, 1, 0, 0, 0, 0};   // XR_KHR_composition_layer_color_scale_bias
+    for (const XrBaseInStructure *n = L->next; n; n = n->next)
+        if (n->type == XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR) {
+            const XrCompositionLayerColorScaleBiasKHR *c = (const XrCompositionLayerColorScaleBiasKHR *)n;
+            memcpy(cb, &c->colorScale, 16); memcpy(cb + 4, &c->colorBias, 16);
+        }
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd = {unorm(sc->fmt), D3D11_SRV_DIMENSION_TEXTURE2DARRAY};
+    sd.Texture2DArray.MipLevels = 1; sd.Texture2DArray.FirstArraySlice = si->imageArrayIndex; sd.Texture2DArray.ArraySize = 1;
+    ID3D11ShaderResourceView *srv;
+    if (FAILED(ID3D11Device_CreateShaderResourceView(s->dev, (ID3D11Resource *)sc->img[sc->released], &sd, &srv))) return;
+    ID3D11DeviceContext *c = s->ctx; D3D11_MAPPED_SUBRESOURCE m;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(c, (ID3D11Resource *)s->cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) { memcpy(m.pData, cb, sizeof cb); ID3D11DeviceContext_Unmap(c, (ID3D11Resource *)s->cb, 0); }
+    ID3D11DeviceContext_PSSetShaderResources(c, 0, 1, &srv);
+    XrCompositionLayerFlags lf = L->layerFlags;
+    ID3D11DeviceContext_OMSetBlendState(c, lf & XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT ?
+        s->blend[(lf & XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT) != 0] : NULL, NULL, 0xffffffff);
+    for (int e = 0; e < 2; e++) {
+        if ((vis == XR_EYE_VISIBILITY_LEFT && e) || (vis == XR_EYE_VISIBILITY_RIGHT && !e)) continue;
+        XrPosef mv = pmul(pinv(eye[e]), world);   // layer -> eye
+        float l = tanf(fov[e].angleLeft), r = tanf(fov[e].angleRight), u = tanf(fov[e].angleUp), d = tanf(fov[e].angleDown);
+        if (FAILED(ID3D11DeviceContext_Map(c, (ID3D11Resource *)s->vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) continue;
+        Vtx *out = m.pData;
+        for (int i = 0; i < nv; i++) {   // asymmetric-frustum projection; z keeps 1 cm near clip, no depth test
+            V p = vadd(qrot(mv.orientation, (V){loc[i].x, loc[i].y, loc[i].z}), mv.position);
+            out[i] = (Vtx){(2 * p.x + (r + l) * p.z) / (r - l), (2 * p.y + (u + d) * p.z) / (u - d), -p.z - 0.01f, -p.z,
+                           u0 + loc[i].u * du, v0 + loc[i].v * dv};
+        }
+        ID3D11DeviceContext_Unmap(c, (ID3D11Resource *)s->vb, 0);
+        D3D11_VIEWPORT vp = {(FLOAT)(e * w), 0, (FLOAT)w, (FLOAT)h, 0, 1};
+        ID3D11DeviceContext_RSSetViewports(c, 1, &vp);
+        ID3D11DeviceContext_Draw(c, (UINT)nv, 0);
+    }
+    rel(srv);
+}
+
+/// Side-by-side render target the layers are drawn into (same colour family as the projection).
+static int ensure_target(Session *s, DXGI_FORMAT fmt, uint32_t w, uint32_t h) {
+    if (s->target && s->targetFmt == fmt && s->targetW == w && s->targetH == h) return 1;
+    rel(s->rtv); rel(s->target); s->rtv = NULL; s->target = NULL;
+    D3D11_TEXTURE2D_DESC d = {w, h, 1, 1, fmt, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET, 0, 0};
+    D3D11_RENDER_TARGET_VIEW_DESC rd = {unorm(fmt), D3D11_RTV_DIMENSION_TEXTURE2D};
+    if (FAILED(ID3D11Device_CreateTexture2D(s->dev, &d, NULL, &s->target)) ||
+        FAILED(ID3D11Device_CreateRenderTargetView(s->dev, (ID3D11Resource *)s->target, &rd, &s->rtv))) {
+        logonce("compositor target %ux%u alloc failed", w, h); rel(s->target); s->target = NULL; return 0;
+    }
+    s->targetFmt = fmt; s->targetW = w; s->targetH = h;
+    return 1;
+}
+static int ensure_staging(Session *s, DXGI_FORMAT fmt, uint32_t w, uint32_t h) {
+    if (s->staging[0] && s->stagingFmt == fmt && s->stagingW == w && s->stagingH == h) return 1;
+    for (int k = 0; k < NSTAGE; k++) { rel(s->staging[k]); s->staging[k] = NULL; s->stagingReady[k] = 0; }
+    s->stagingFmt = 0; s->stagingW = s->stagingH = 0;
+    D3D11_TEXTURE2D_DESC d = {w, h, 1, 1, fmt, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
+    for (int k = 0; k < NSTAGE; k++)
+        if (FAILED(ID3D11Device_CreateTexture2D(s->dev, &d, NULL, &s->staging[k]))) {
+            logmsg("staging alloc %ux%u failed at %d", w, h, k);
+            for (int r = 0; r < NSTAGE; r++) { rel(s->staging[r]); s->staging[r] = NULL; }
+            return 0;
+        }
+    s->stagingFmt = fmt; s->stagingW = w; s->stagingH = h;
+    return 1;
+}
+
+// D3D12: readback buffers (rows padded to 256 bytes) filled by a command list per slot on the game's queue.
+static int ensure_readback12(Session *s, DXGI_FORMAT fmt, uint32_t w, uint32_t h) {
+    if (s->rb[0] && s->stagingFmt == fmt && s->stagingW == w && s->stagingH == h) return 1;
+    wait_gpu12(s, s->fenceValue);   // no copy may still be landing in the buffers we drop
+    for (int k = 0; k < NSTAGE; k++) { rel(s->rb[k]); s->rb[k] = NULL; s->stagingReady[k] = 0; }
+    s->stagingFmt = 0; s->stagingW = s->stagingH = 0;
+    s->rbPitch = (w * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_READBACK, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
+    D3D12_RESOURCE_DESC d = {D3D12_RESOURCE_DIMENSION_BUFFER, 0, (UINT64)s->rbPitch * h, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+    for (int k = 0; k < NSTAGE; k++)
+        if (FAILED(ID3D12Device_CreateCommittedResource(s->dev12, &hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&s->rb[k]))) {
+            logmsg("readback alloc %ux%u failed at %d", w, h, k);
+            for (int r = 0; r < NSTAGE; r++) { rel(s->rb[r]); s->rb[r] = NULL; }
+            return 0;
+        }
+    s->stagingFmt = fmt; s->stagingW = w; s->stagingH = h;
+    return 1;
+}
+static void copy12(Session *s, int k, const XrCompositionLayerProjection *proj, Swapchain *sc[2], uint32_t w, uint32_t hgt) {
+    wait_gpu12(s, s->rbFence[k]);   // the slot's previous copy must be done before its allocator is reused (ring: almost never waits)
+    ID3D12GraphicsCommandList *cl = s->cl[k];
+    ID3D12CommandAllocator_Reset(s->alloc[k]); ID3D12GraphicsCommandList_Reset(cl, s->alloc[k], NULL);
+    for (int e = 0; e < 2; e++) {   // images are handed back in RENDER_TARGET state (XR_KHR_D3D12_enable)
+        const XrSwapchainSubImage *si = &proj->views[e].subImage;
+        ID3D12Resource *img = sc[e]->img12[sc[e]->released]; UINT sub = si->imageArrayIndex * sc[e]->mips;
+        D3D12_RESOURCE_BARRIER b = {D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_FLAG_NONE};
+        b.Transition = (D3D12_RESOURCE_TRANSITION_BARRIER){img, sub, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        ID3D12GraphicsCommandList_ResourceBarrier(cl, 1, &b);
+        D3D12_TEXTURE_COPY_LOCATION to = {s->rb[k], D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT}, from = {img, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        to.PlacedFootprint.Footprint = (D3D12_SUBRESOURCE_FOOTPRINT){sc[e]->fmt, 2 * w, hgt, 1, s->rbPitch};
+        from.SubresourceIndex = sub;
+        D3D12_BOX box = {(UINT)si->imageRect.offset.x, (UINT)si->imageRect.offset.y, 0, (UINT)si->imageRect.offset.x + w, (UINT)si->imageRect.offset.y + hgt, 1};
+        ID3D12GraphicsCommandList_CopyTextureRegion(cl, &to, e * w, 0, 0, &from, &box);
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE; b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        ID3D12GraphicsCommandList_ResourceBarrier(cl, 1, &b);
+    }
+    ID3D12GraphicsCommandList_Close(cl);
+    ID3D12CommandQueue_ExecuteCommandLists(s->queue, 1, (ID3D12CommandList *const *)&cl);
+    ID3D12CommandQueue_Signal(s->queue, s->fence, ++s->fenceValue);
+    s->rbFence[k] = s->fenceValue;
+}
+
+/// Publishes the newest finished readback slot to shared memory; never waits on the GPU.
+static void publish(Session *s, const XrFrameEndInfo *fi) {
+    // GPU completes copies in submit order: try pending slots newest-first, publish the first one whose Map succeeds.
+    int order[NSTAGE], n = 0;
+    for (int k = 0; k < NSTAGE; k++) if (s->stagingReady[k]) order[n++] = k;
+    for (int i = 1; i < n; i++) for (int j = i; j > 0 && s->stagingReady[order[j]] > s->stagingReady[order[j - 1]]; j--) {
+        int t = order[j]; order[j] = order[j - 1]; order[j - 1] = t;
+    }
+    int k = -1; uint32_t pitch = 0; void *src = NULL;
+    uint64_t done = s->fence ? ID3D12Fence_GetCompletedValue(s->fence) : 0;
+    D3D12_RANGE all = {0, (SIZE_T)s->rbPitch * s->stagingH}, none = {0, 0};
+    for (int i = 0; i < n && k < 0; i++) {
+        int c = order[i]; D3D11_MAPPED_SUBRESOURCE m;
+        if (s->dev12) { if (done >= s->rbFence[c] && SUCCEEDED(ID3D12Resource_Map(s->rb[c], 0, &all, &src))) { k = c; pitch = s->rbPitch; } }
+        else if (SUCCEEDED(ID3D11DeviceContext_Map(s->ctx, (ID3D11Resource *)s->staging[c], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m))) { k = c; src = m.pData; pitch = m.RowPitch; }
+    }
+    if (k < 0) return;   // nothing finished yet; never block the game thread
+    for (int j = 0; j < NSTAGE; j++)         // older pending copies are stale now
+        if (s->stagingReady[j] && s->stagingReady[j] < s->stagingReady[k]) s->stagingReady[j] = 0;
+    int64_t copyT0 = qpc_ns();
+    uint32_t buf = (shm->frame_seq + 1) % 2, row = s->stagingW * 4;
+    uint8_t *dst = vr4_frame(shm, buf);
+    if (pitch == row) memcpy(dst, src, (size_t)row * s->stagingH);   // channel order fixed up on the Mac (frame_rgba)
+    else for (uint32_t y = 0; y < s->stagingH; y++) memcpy(dst + (size_t)y * row, (const uint8_t *)src + (size_t)y * pitch, row);
+    if (s->dev12) ID3D12Resource_Unmap(s->rb[k], 0, &none);
+    else ID3D11DeviceContext_Unmap(s->ctx, (ID3D11Resource *)s->staging[k], 0);
+    s->stagingReady[k] = 0;
+    shm->frame_eye_pose[buf][0] = s->stagingPose[k][0]; shm->frame_eye_pose[buf][1] = s->stagingPose[k][1];
+    shm->frame_w[buf] = s->stagingW; shm->frame_h[buf] = s->stagingH; shm->frame_rgba[buf] = (uint32_t)is_rgba(s->stagingFmt);
+    shm->frame_time_ns[buf] = s->stagingDisplayTime[k];
+    s->lastPublished = (uint64_t)fi->displayTime;
+    copySum += qpc_ns() - copyT0;
+    shm->runtime_heartbeat_ns = (uint64_t)qpc_ns();
+    vr4_fence();
+    shm->frame_seq++;
+}
 
 static XrResult XRAPI_CALL xrEndFrameImpl(XrSession h, const XrFrameEndInfo *fi);
 static XrResult XRAPI_CALL xrEndFrame_(XrSession h, const XrFrameEndInfo *fi) {
@@ -706,75 +1122,26 @@ static XrResult XRAPI_CALL xrEndFrame_(XrSession h, const XrFrameEndInfo *fi) {
     endSum += qpc_ns() - endT0;
     return r;
 }
-// Fallback for apps that submit quad layers without a stereo projection (menus, media players):
-// letterbox the first quad into both eyes so the headset shows something instead of a stale frame.
-static XrResult XRAPI_CALL endFrameQuad(Session *s, const XrFrameEndInfo *fi) {
-    const XrCompositionLayerQuad *q = NULL;
-    for (uint32_t i = 0; i < fi->layerCount; i++)
-        if (fi->layers[i] && fi->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_QUAD) { q = (const XrCompositionLayerQuad *)fi->layers[i]; break; }
-    if (!q) {
-        static int warned_eq;
-        for (uint32_t i = 0; i < fi->layerCount; i++)
-            if (fi->layers[i] && fi->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_EQUIRECT_KHR && !warned_eq++)
-                logmsg("equirect layers are not composited yet");
-        return XR_SUCCESS;
-    }
-    Swapchain *sc = find_sc(q->subImage.swapchain);
-    if (!sc || sc->released < 0) return XR_SUCCESS;
-    uint32_t sw = (uint32_t)q->subImage.imageRect.extent.width, sh = (uint32_t)q->subImage.imageRect.extent.height;
-    int32_t ox = q->subImage.imageRect.offset.x, oy = q->subImage.imageRect.offset.y;
-    if (!sw || !sh || ox < 0 || oy < 0 || (uint32_t)ox + sw > sc->w || (uint32_t)oy + sh > sc->h ||
-        q->subImage.imageArrayIndex >= sc->array) return XR_SUCCESS;
-    if (!s->fallback || s->fbW != sw || s->fbH != sh) {
-        if (s->fallback) { ID3D11Texture2D_Release(s->fallback); s->fallback = NULL; }
-        D3D11_TEXTURE2D_DESC d = {sw, sh, 1, 1, sc->fmt, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
-        if (FAILED(ID3D11Device_CreateTexture2D(s->dev, &d, NULL, &s->fallback))) { s->fallback = NULL; return XR_SUCCESS; }
-        s->fbW = sw; s->fbH = sh;
-    }
-    D3D11_BOX box = {(UINT)ox, (UINT)oy, 0, (UINT)(ox + (int32_t)sw), (UINT)(oy + (int32_t)sh), 1};
-    ID3D11DeviceContext_CopySubresourceRegion(s->ctx, (ID3D11Resource *)s->fallback, 0, 0, 0, 0,
-        (ID3D11Resource *)sc->img[sc->released], q->subImage.imageArrayIndex * sc->mips, &box);
-    D3D11_MAPPED_SUBRESOURCE m;
-    if (FAILED(ID3D11DeviceContext_Map(s->ctx, (ID3D11Resource *)s->fallback, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m))) return XR_SUCCESS;
-    uint32_t dw = eye_w(), dh = eye_h();
-    if (2ULL * dw * dh * 4ULL > (uint64_t)VR4_FRAME_MAX) { ID3D11DeviceContext_Unmap(s->ctx, (ID3D11Resource *)s->fallback, 0); return XR_SUCCESS; }
-    uint32_t buf = (shm->frame_seq + 1) % 2;
-    uint8_t *dst = vr4_frame(shm, buf);
-    float scf = (float)dw / sw < (float)dh / sh ? (float)dw / sw : (float)dh / sh;
-    uint32_t tw = (uint32_t)(sw * scf), th = (uint32_t)(sh * scf);
-    if (!tw) tw = 1;
-    if (!th) th = 1;
-    if (tw > dw) tw = dw;
-    if (th > dh) th = dh;
-    uint32_t x0 = (dw - tw) / 2, y0 = (dh - th) / 2;
-    memset(dst, 0, (size_t)2 * dw * dh * 4);
-    for (uint32_t y = 0; y < th; y++) {
-        const uint32_t *src = (const uint32_t *)((const uint8_t *)m.pData + (size_t)(y * sh / th) * m.RowPitch);
-        for (int e = 0; e < 2; e++) {
-            uint32_t *out = (uint32_t *)(dst + ((size_t)(y0 + y) * 2 * dw + (size_t)e * dw + x0) * 4);
-            for (uint32_t x = 0; x < tw; x++) out[x] = src[x * sw / tw];
-        }
-    }
-    ID3D11DeviceContext_Unmap(s->ctx, (ID3D11Resource *)s->fallback, 0);
-    shm->frame_w[buf] = 2 * dw; shm->frame_h[buf] = dh; shm->frame_rgba[buf] = (uint32_t)is_rgba(sc->fmt);
-    shm->frame_time_ns[buf] = (uint64_t)fi->displayTime;
-    shm->frame_eye_pose[buf][0] = frameTrack.head; shm->frame_eye_pose[buf][1] = frameTrack.head;
-    s->lastPublished = (uint64_t)fi->displayTime;
-    shm->runtime_heartbeat_ns = (uint64_t)qpc_ns();
-    vr4_fence();
-    shm->frame_seq++;
-    return XR_SUCCESS;
-}
 static XrResult XRAPI_CALL xrEndFrameImpl(XrSession h, const XrFrameEndInfo *fi) {
     Session *s = (Session *)h;
-    if (!s || !s->dev || !s->ctx || !fi) return XR_ERROR_HANDLE_INVALID;
+    if (!s || !fi) return XR_ERROR_HANDLE_INVALID;
     if (fi->displayTime && (uint64_t)fi->displayTime == s->lastPublished) {
         shm->runtime_heartbeat_ns = (uint64_t)qpc_ns();   // same frame re-submitted: no new pixels, stay alive
         return XR_SUCCESS;
     }
-    const XrCompositionLayerProjection *proj = NULL;
-    for (uint32_t i = 0; i < fi->layerCount; i++)
-        if (fi->layers[i] && fi->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) { proj = (const XrCompositionLayerProjection *)fi->layers[i]; break; }
+    int pi = -1, nover = 0;
+    for (uint32_t i = 0; i < fi->layerCount && pi < 0; i++)
+        if (fi->layers[i] && fi->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) pi = (int)i;
+    for (uint32_t i = 0; i < fi->layerCount; i++) {
+        const XrCompositionLayerBaseHeader *l = fi->layers[i];
+        if (!l || (int)i == pi) continue;
+        if (is_overlay(l)) nover += (int)i > pi;
+        else {
+            char name[XR_MAX_STRUCTURE_NAME_SIZE]; xrStructureTypeToString_(XR_NULL_HANDLE, l->type, name);
+            logonce("%s layers are not composited", name);
+        }
+    }
+    const XrCompositionLayerProjection *proj = pi >= 0 ? (const XrCompositionLayerProjection *)fi->layers[pi] : NULL;
     static int layersLogged;
     if (layersLogged < 3 && fi->layerCount) {
         layersLogged++;
@@ -785,171 +1152,160 @@ static XrResult XRAPI_CALL xrEndFrameImpl(XrSession h, const XrFrameEndInfo *fi)
                    si->imageRect.extent.width, si->imageRect.extent.height, si->imageArrayIndex);
         }
     }
-    if (!proj || proj->viewCount < 2) return endFrameQuad(s, fi);   // no stereo projection: quad fallback or nothing
-
-    Swapchain *sc[2] = { find_sc(proj->views[0].subImage.swapchain), find_sc(proj->views[1].subImage.swapchain) };
-    if (!sc[0] || !sc[1]) {
-        static int warned_sc; if (!warned_sc++) logmsg("xrEndFrame: invalid swapchain handle");
-        return XR_ERROR_HANDLE_INVALID;
-    }
-    if (sc[0]->released < 0 || sc[1]->released < 0) return XR_SUCCESS;
-
-    uint64_t w = (uint64_t)proj->views[0].subImage.imageRect.extent.width, hgt = (uint64_t)proj->views[0].subImage.imageRect.extent.height;
-    if (!w || !hgt || (uint64_t)proj->views[1].subImage.imageRect.extent.width != w || (uint64_t)proj->views[1].subImage.imageRect.extent.height != hgt ||
-        2ULL * w * hgt * 4ULL > (uint64_t)VR4_FRAME_MAX) {
-        static int warned; if (!warned++) logmsg("unsupported eye rects %llux%llu / %dx%d", (unsigned long long)w, (unsigned long long)hgt, proj->views[1].subImage.imageRect.extent.width, proj->views[1].subImage.imageRect.extent.height);
-        return XR_SUCCESS;
-    }
-
-    DXGI_FORMAT fmt = sc[0]->fmt;
-    if (sc[1]->fmt != fmt) {
-        static int warned_fmt; if (!warned_fmt++) logmsg("mismatched swapchain formats between eyes: %d vs %d", sc[0]->fmt, sc[1]->fmt);
-        return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
-    }
-
-    // Bounds checking for rects and array indices against swapchain metadata
-    for (int e = 0; e < 2; e++) {
-        const XrSwapchainSubImage *si = &proj->views[e].subImage;
-        if (si->imageArrayIndex >= sc[e]->array) {
-            static int warned_arr; if (!warned_arr++) logmsg("eye %d imageArrayIndex %u >= %u", e, si->imageArrayIndex, sc[e]->array);
-            return XR_ERROR_RUNTIME_FAILURE;
+    const VR4Tracking *ft = frame_for(fi->displayTime);
+    Swapchain *sc[2] = {0}; uint32_t w, hgt; DXGI_FORMAT fmt; XrPosef eye[2]; XrFovf fov[2];
+    if (proj) {
+        if (proj->viewCount < 2) { logonce("projection layer with %u views", proj->viewCount); return XR_SUCCESS; }
+        sc[0] = find_sc(proj->views[0].subImage.swapchain); sc[1] = find_sc(proj->views[1].subImage.swapchain);
+        if (!sc[0] || !sc[1]) { logonce("xrEndFrame: invalid swapchain handle"); return XR_ERROR_HANDLE_INVALID; }
+        if (sc[0]->released < 0 || sc[1]->released < 0) return XR_SUCCESS;
+        w = (uint32_t)proj->views[0].subImage.imageRect.extent.width; hgt = (uint32_t)proj->views[0].subImage.imageRect.extent.height;
+        if (!w || !hgt || proj->views[1].subImage.imageRect.extent.width != (int32_t)w || proj->views[1].subImage.imageRect.extent.height != (int32_t)hgt) {
+            logonce("unsupported eye rects %ux%u / %dx%d", w, hgt, proj->views[1].subImage.imageRect.extent.width, proj->views[1].subImage.imageRect.extent.height);
+            return XR_SUCCESS;
         }
-        if (si->imageRect.offset.x < 0 || si->imageRect.offset.y < 0 ||
-            (uint64_t)si->imageRect.offset.x + w > (uint64_t)sc[e]->w ||
-            (uint64_t)si->imageRect.offset.y + hgt > (uint64_t)sc[e]->h) {
-            static int warned_rect; if (!warned_rect++) logmsg("eye %d imageRect bounds overflow", e);
-            return XR_ERROR_RUNTIME_FAILURE;
+        fmt = sc[0]->fmt;
+        if (sc[1]->fmt != fmt) { logonce("mismatched swapchain formats between eyes: %d vs %d", sc[0]->fmt, sc[1]->fmt); return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED; }
+        if (!is_color(fmt)) { logonce("projection swapchain format %d is not 8-bit colour", fmt); return XR_SUCCESS; }
+        for (int e = 0; e < 2; e++) {   // bounds checking for rects and array indices against swapchain metadata
+            const XrSwapchainSubImage *si = &proj->views[e].subImage;
+            if (si->imageArrayIndex >= sc[e]->array) { logonce("eye %d imageArrayIndex %u >= %u", e, si->imageArrayIndex, sc[e]->array); return XR_ERROR_RUNTIME_FAILURE; }
+            if (si->imageRect.offset.x < 0 || si->imageRect.offset.y < 0 || (uint64_t)si->imageRect.offset.x + w > sc[e]->w ||
+                (uint64_t)si->imageRect.offset.y + hgt > sc[e]->h) { logonce("eye %d imageRect bounds overflow", e); return XR_ERROR_RUNTIME_FAILURE; }
+        }
+        int valid; XrPosef base = proj->space ? space_in_stage_at((Space *)proj->space, ft, &valid) : IDENT;
+        for (int e = 0; e < 2; e++) { eye[e] = pmul(base, proj->views[e].pose); fov[e] = proj->views[e].fov; }
+    } else {   // layers only (menus, players, loading screens)
+        if (!nover) return XR_SUCCESS;
+        w = eye_w(); hgt = eye_h(); fmt = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        for (int e = 0; e < 2; e++) {
+            const VR4Fov *f = &ft->eye[e].fov;
+            eye[e] = xp(ft->eye[e].pose); fov[e] = (XrFovf){f->left, f->right, f->up, f->down};
         }
     }
-
-    // Reallocate staging textures if dimensions or format changed
-    if (!s->staging[0][0] || s->stagingFmt != fmt || s->stagingW != (uint32_t)w || s->stagingH != (uint32_t)hgt) {
-        for (int k = 0; k < NSTAGE; k++) {
-            s->stagingReady[k] = 0;
-            for (int e = 0; e < 2; e++) {
-                if (s->staging[k][e]) { ID3D11Texture2D_Release(s->staging[k][e]); s->staging[k][e] = NULL; }
-            }
-        }
-        D3D11_TEXTURE2D_DESC d = {(UINT)w, (UINT)hgt, 1, 1, fmt, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
-        for (int k = 0; k < NSTAGE; k++) {
-            for (int e = 0; e < 2; e++) {
-                if (FAILED(ID3D11Device_CreateTexture2D(s->dev, &d, NULL, &s->staging[k][e]))) {
-                    logmsg("staging alloc failed at [%d][%d], rolling back", k, e);
-                    for (int rk = 0; rk < NSTAGE; rk++) {
-                        s->stagingReady[rk] = 0;
-                        for (int re = 0; re < 2; re++)
-                            if (s->staging[rk][re]) { ID3D11Texture2D_Release(s->staging[rk][re]); s->staging[rk][re] = NULL; }
-                    }
-                    s->stagingFmt = 0; s->stagingW = s->stagingH = 0;
-                    return XR_SUCCESS;
-                }
-            }
-        }
-        s->stagingFmt = fmt; s->stagingW = (uint32_t)w; s->stagingH = (uint32_t)hgt;
+    if (2ULL * w * hgt * 4ULL > (uint64_t)VR4_FRAME_MAX) { logonce("eye %ux%u too large for the frame buffer", w, hgt); return XR_SUCCESS; }
+    if (s->dev12) {
+        if (nover) logonce("quad/cylinder layers are not composited for D3D12 games");
+        if (!proj || !s->fence || !ensure_readback12(s, fmt, 2 * w, hgt)) return XR_SUCCESS;
+    } else {
+        if (nover && !comp_init(s)) { if (!proj) return XR_SUCCESS; nover = 0; }
+        if (!ensure_staging(s, fmt, 2 * w, hgt) || (nover && !ensure_target(s, fmt, 2 * w, hgt))) return XR_SUCCESS;
     }
 
     // Ring of NSTAGE readback slots: D3DMetal GPU latency is >1 frame, so a 2-slot flip overwrote unread copies and
     // published only ~every other frame (30 fps at 72). Copy into a free slot (or the oldest), publish the newest done.
-    int curStage = 0;
-    for (int k = 1; k < NSTAGE; k++)
-        if (s->stagingReady[k] < s->stagingReady[curStage]) curStage = k;   // free (0) or oldest pending
-    for (int e = 0; e < 2; e++) {
-        const XrSwapchainSubImage *si = &proj->views[e].subImage;
-        D3D11_BOX box = {(UINT)si->imageRect.offset.x, (UINT)si->imageRect.offset.y, 0, 0, 0, 1};
-        box.right = box.left + (UINT)w; box.bottom = box.top + (UINT)hgt;
-        ID3D11DeviceContext_CopySubresourceRegion(s->ctx, (ID3D11Resource *)s->staging[curStage][e], 0, 0, 0, 0,
-            (ID3D11Resource *)sc[e]->img[sc[e]->released], si->imageArrayIndex * sc[e]->mips, &box);
-
-        s->stagingPose[curStage][e] = (VR4Pose){proj->views[e].pose.position.x, proj->views[e].pose.position.y, proj->views[e].pose.position.z,
-                                               proj->views[e].pose.orientation.x, proj->views[e].pose.orientation.y, proj->views[e].pose.orientation.z, proj->views[e].pose.orientation.w};
-    }
-    s->stagingDisplayTime[curStage] = (uint64_t)fi->displayTime;
-    s->stagingReady[curStage] = ++s->stagingCounter;
-
-    // GPU completes copies in submit order: try pending slots newest-first, publish the first one whose Map succeeds.
-    int order[NSTAGE], n = 0;
-    for (int k = 0; k < NSTAGE; k++) if (s->stagingReady[k]) order[n++] = k;
-    for (int i = 1; i < n; i++) for (int j = i; j > 0 && s->stagingReady[order[j]] > s->stagingReady[order[j - 1]]; j--) {
-        int t = order[j]; order[j] = order[j - 1]; order[j - 1] = t;
-    }
-    int readStage = -1;
-    D3D11_MAPPED_SUBRESOURCE m[2];
-    for (int i = 0; i < n && readStage < 0; i++) {
-        int k = order[i];
-        if (FAILED(ID3D11DeviceContext_Map(s->ctx, (ID3D11Resource *)s->staging[k][0], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m[0]))) continue;
-        if (FAILED(ID3D11DeviceContext_Map(s->ctx, (ID3D11Resource *)s->staging[k][1], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m[1]))) {
-            ID3D11DeviceContext_Unmap(s->ctx, (ID3D11Resource *)s->staging[k][0], 0);
-            continue;
+    int k = 0;
+    for (int j = 1; j < NSTAGE; j++)
+        if (s->stagingReady[j] < s->stagingReady[k]) k = j;   // free (0) or oldest pending
+    if (s->dev12) copy12(s, k, proj, sc, w, hgt);
+    else {
+        ID3D11DeviceContext *c = s->ctx;
+        ID3D11Resource *dst = nover ? (ID3D11Resource *)s->target : (ID3D11Resource *)s->staging[k];
+        if (proj) for (int e = 0; e < 2; e++) {   // both eyes side by side
+            const XrSwapchainSubImage *si = &proj->views[e].subImage;
+            D3D11_BOX box = {(UINT)si->imageRect.offset.x, (UINT)si->imageRect.offset.y, 0, (UINT)si->imageRect.offset.x + w, (UINT)si->imageRect.offset.y + hgt, 1};
+            ID3D11DeviceContext_CopySubresourceRegion(c, dst, 0, e * w, 0, 0, (ID3D11Resource *)sc[e]->img[sc[e]->released], si->imageArrayIndex * sc[e]->mips, &box);
+        } else {
+            static const FLOAT black[4] = {0, 0, 0, 1};
+            ID3D11DeviceContext_ClearRenderTargetView(c, s->rtv, black);
         }
-        readStage = k;
-    }
-    if (readStage < 0) return XR_SUCCESS;   // nothing finished yet; never block the game thread
-    for (int k = 0; k < NSTAGE; k++)         // older pending copies are stale now
-        if (s->stagingReady[k] && s->stagingReady[k] < s->stagingReady[readStage]) s->stagingReady[k] = 0;
-    int isRgbaFmt = is_rgba(fmt);
-
-    int64_t copyT0 = qpc_ns();
-    uint32_t buf = (shm->frame_seq + 1) % 2;
-    uint8_t *dst = vr4_frame(shm, buf);
-    for (int e = 0; e < 2; e++) {
-        for (uint32_t y = 0; y < (uint32_t)hgt; y++) {
-            const uint32_t *src = (const uint32_t *)((const uint8_t *)m[e].pData + y * m[e].RowPitch);
-            uint32_t *out = (uint32_t *)(dst + (y * 2 * (uint32_t)w + e * (uint32_t)w) * 4);
-            memcpy(out, src, (size_t)w * 4);   // channel order fixed up on the Mac (frame_rgba)
+        if (nover) {
+            SavedState z = {0}; save_state(c, &z);
+            UINT stride = sizeof(Vtx), off = 0;
+            ID3D11DeviceContext_IASetInputLayout(c, s->il); ID3D11DeviceContext_IASetPrimitiveTopology(c, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            ID3D11DeviceContext_IASetVertexBuffers(c, 0, 1, &s->vb, &stride, &off);
+            ID3D11DeviceContext_VSSetShader(c, s->vs, NULL, 0); ID3D11DeviceContext_HSSetShader(c, NULL, NULL, 0);
+            ID3D11DeviceContext_DSSetShader(c, NULL, NULL, 0); ID3D11DeviceContext_GSSetShader(c, NULL, NULL, 0);
+            ID3D11DeviceContext_PSSetShader(c, s->ps, NULL, 0); ID3D11DeviceContext_PSSetConstantBuffers(c, 0, 1, &s->cb);
+            ID3D11DeviceContext_PSSetSamplers(c, 0, 1, &s->smp); ID3D11DeviceContext_RSSetState(c, s->rs);
+            ID3D11DeviceContext_OMSetRenderTargets(c, 1, &s->rtv, NULL); ID3D11DeviceContext_OMSetDepthStencilState(c, NULL, 0);
+            for (uint32_t i = (uint32_t)(pi + 1); i < fi->layerCount; i++)
+                if (is_overlay(fi->layers[i])) draw_layer(s, fi->layers[i], ft, eye, fov, w, hgt);
+            restore_state(c, &z);
+            ID3D11DeviceContext_CopyResource(c, (ID3D11Resource *)s->staging[k], (ID3D11Resource *)s->target);
         }
-        ID3D11DeviceContext_Unmap(s->ctx, (ID3D11Resource *)s->staging[readStage][e], 0);
-        shm->frame_eye_pose[buf][e] = s->stagingPose[readStage][e];
+        ID3D11DeviceContext_Flush(c);   // start the copy now, not at the game's next flush
     }
-    s->stagingReady[readStage] = 0;
-    shm->frame_w[buf] = 2 * (uint32_t)w; shm->frame_h[buf] = (uint32_t)hgt; shm->frame_rgba[buf] = (uint32_t)isRgbaFmt;
-    shm->frame_time_ns[buf] = s->stagingDisplayTime[readStage];
-    s->lastPublished = (uint64_t)fi->displayTime;
-    copySum += qpc_ns() - copyT0;
-    shm->runtime_heartbeat_ns = (uint64_t)qpc_ns();
-    vr4_fence();
-    shm->frame_seq++;
+    for (int e = 0; e < 2; e++) s->stagingPose[k][e] = raw_pose(eye[e]);   // stage space: the Mac reprojects the backdrop with these
+    s->stagingDisplayTime[k] = (uint64_t)fi->displayTime;
+    s->stagingReady[k] = ++s->stagingCounter;
+    publish(s, fi);
     return XR_SUCCESS;
 }
 
 
 // ---------------------------------------------------------------- swapchains
-static const int64_t formats[] = {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM};
+// Colour formats first (8-bit, raw bytes streamed as sRGB); depth formats serve XR_KHR_composition_layer_depth.
+static const int64_t formats[] = {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM,
+                                  DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_D32_FLOAT_S8X24_UINT};
+#define NFORMATS (uint32_t)(sizeof formats / sizeof *formats)
 static XrResult XRAPI_CALL xrEnumerateSwapchainFormats_(XrSession h, uint32_t cap, uint32_t *n, int64_t *f) {
-    (void)h; FILL_ARRAY(cap, n, f, 4, f[i_] = formats[i_]); return XR_SUCCESS;
+    (void)h; FILL_ARRAY(cap, n, f, NFORMATS, f[i_] = formats[i_]); return XR_SUCCESS;
 }
-static DXGI_FORMAT typeless(DXGI_FORMAT f) {
-    return f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ? DXGI_FORMAT_R8G8B8A8_TYPELESS : DXGI_FORMAT_B8G8R8A8_TYPELESS;
+static DXGI_FORMAT typeless(DXGI_FORMAT f) {   // so games can make sRGB or linear views (and depth views) of the same image
+    switch (f) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+        case DXGI_FORMAT_D32_FLOAT: return DXGI_FORMAT_R32_TYPELESS;
+        case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24G8_TYPELESS;
+        case DXGI_FORMAT_D16_UNORM: return DXGI_FORMAT_R16_TYPELESS;
+        default: return DXGI_FORMAT_R32G8X24_TYPELESS;
+    }
 }
 static XrResult XRAPI_CALL xrCreateSwapchain_(XrSession h, const XrSwapchainCreateInfo *ci, XrSwapchain *out) {
     Session *s = (Session *)h;
     int ok = 0;
-    for (int i = 0; i < 4; i++) ok |= formats[i] == ci->format;
-    if (!ok) { logmsg("swapchain format %lld unsupported", (long long)ci->format); return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED; }
-    if (ci->sampleCount > 1) {
-        static int warned_msaa; if (!warned_msaa++) logmsg("swapchain asks %u samples: accepted without MSAA (game renders unaliased)", ci->sampleCount);
-    }
+    for (uint32_t i = 0; i < NFORMATS; i++) ok |= formats[i] == ci->format;
+    if (!ok) { logonce("swapchain format %lld unsupported", (long long)ci->format); return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED; }
+    if (ci->sampleCount > 1) logonce("swapchain asks %u samples: accepted without MSAA (game renders unaliased)", ci->sampleCount);
     logmsg("swapchain fmt %lld %ux%u array %u mips %u faces %u usage 0x%llx flags 0x%llx", (long long)ci->format, ci->width, ci->height,
            ci->arraySize, ci->mipCount, ci->faceCount, (unsigned long long)ci->usageFlags, (unsigned long long)ci->createFlags);
     Swapchain *sc = calloc(1, sizeof *sc);
-    sc->fmt = typeless((DXGI_FORMAT)ci->format); sc->w = ci->width; sc->h = ci->height; sc->array = ci->arraySize; sc->mips = ci->mipCount ? ci->mipCount : 1; sc->released = -1;
+    sc->fmt = typeless((DXGI_FORMAT)ci->format); sc->w = ci->width; sc->h = ci->height; sc->array = ci->arraySize ? ci->arraySize : 1;
+    sc->mips = ci->mipCount ? ci->mipCount : 1; sc->released = -1;
     sc->count = ci->createFlags & XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT ? 1 : 3;
+    if (s->dev12) {   // handed out in the states XR_KHR_D3D12_enable promises: RENDER_TARGET / DEPTH_WRITE
+        int color = is_color(sc->fmt);
+        D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
+        D3D12_RESOURCE_DESC rd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, ci->width, ci->height, (UINT16)sc->array, (UINT16)sc->mips, sc->fmt, {1, 0},
+            D3D12_TEXTURE_LAYOUT_UNKNOWN, !color ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+            (ci->usageFlags & XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE)};
+        for (int i = 0; i < sc->count; i++)
+            if (FAILED(ID3D12Device_CreateCommittedResource(s->dev12, &hp, D3D12_HEAP_FLAG_NONE, &rd, color ? D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                                                            NULL, &IID_ID3D12Resource, (void **)&sc->img12[i]))) {
+                logmsg("CreateCommittedResource failed for swapchain format %lld", (long long)ci->format);
+                for (int j = 0; j < i; j++) rel(sc->img12[j]);
+                free(sc); return XR_ERROR_RUNTIME_FAILURE;
+            }
+        *out = (XrSwapchain)sc;
+        return XR_SUCCESS;
+    }
     UINT bind = D3D11_BIND_SHADER_RESOURCE;
-    if (ci->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) bind |= D3D11_BIND_RENDER_TARGET;
-    if (ci->usageFlags & XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT) bind |= D3D11_BIND_UNORDERED_ACCESS;
-    D3D11_TEXTURE2D_DESC d = {ci->width, ci->height, ci->mipCount ? ci->mipCount : 1, ci->arraySize ? ci->arraySize : 1, sc->fmt, {1, 0},
-                              D3D11_USAGE_DEFAULT, bind, 0, 0};
+    if (!is_color(sc->fmt)) bind |= D3D11_BIND_DEPTH_STENCIL;
+    else if (ci->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) bind |= D3D11_BIND_RENDER_TARGET;
+    if (is_color(sc->fmt) && (ci->usageFlags & XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT)) bind |= D3D11_BIND_UNORDERED_ACCESS;
+    D3D11_TEXTURE2D_DESC d = {ci->width, ci->height, sc->mips, sc->array, sc->fmt, {1, 0}, D3D11_USAGE_DEFAULT, bind, 0, 0};
     for (int i = 0; i < sc->count; i++)
-        if (FAILED(ID3D11Device_CreateTexture2D(s->dev, &d, NULL, &sc->img[i]))) { logmsg("CreateTexture2D failed"); free(sc); return XR_ERROR_RUNTIME_FAILURE; }
+        if (FAILED(ID3D11Device_CreateTexture2D(s->dev, &d, NULL, &sc->img[i]))) {
+            logmsg("CreateTexture2D failed for swapchain format %lld", (long long)ci->format);
+            for (int j = 0; j < i; j++) rel(sc->img[j]);
+            free(sc); return XR_ERROR_RUNTIME_FAILURE;
+        }
     *out = (XrSwapchain)sc;
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrDestroySwapchain_(XrSwapchain h) {
     Swapchain *sc = find_sc(h);
-    for (int i = 0; i < sc->count; i++) ID3D11Texture2D_Release(sc->img[i]);
+    for (int i = 0; i < sc->count; i++) { rel(sc->img[i]); rel(sc->img12[i]); }
     free(sc); return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrEnumerateSwapchainImages_(XrSwapchain h, uint32_t cap, uint32_t *n, XrSwapchainImageBaseHeader *imgs) {
     Swapchain *sc = find_sc(h);
+    if (sc->img12[0]) {
+        XrSwapchainImageD3D12KHR *d = (XrSwapchainImageD3D12KHR *)imgs;
+        FILL_ARRAY(cap, n, d, (uint32_t)sc->count, d[i_].texture = sc->img12[i_]);
+        return XR_SUCCESS;
+    }
     XrSwapchainImageD3D11KHR *d = (XrSwapchainImageD3D11KHR *)imgs;
     FILL_ARRAY(cap, n, d, (uint32_t)sc->count, d[i_].texture = sc->img[i_]);
     return XR_SUCCESS;
@@ -979,49 +1335,61 @@ static XrResult XRAPI_CALL xrCreateAction_(XrActionSet set, const XrActionCreate
 static XrResult XRAPI_CALL xrDestroyAction_(XrAction a) { (void)a; return XR_SUCCESS; }   // may still be referenced by suggestions
 static XrResult XRAPI_CALL xrSuggestInteractionProfileBindings_(XrInstance i, const XrInteractionProfileSuggestedBinding *sb) {
     (void)i;
+    int j = 0;   // a later call for the same profile replaces its earlier bindings
+    for (int k = 0; k < nsugg; k++) if (sugg[k].profile != sb->interactionProfile) sugg[j++] = sugg[k];
+    nsugg = j;
     for (uint32_t k = 0; k < sb->countSuggestedBindings && nsugg < 1024; k++)
         sugg[nsugg++] = (Suggestion){sb->interactionProfile, (Action *)sb->suggestedBindings[k].action, sb->suggestedBindings[k].binding};
+    logmsg("suggested %u bindings for %s%s", sb->countSuggestedBindings, pstr(sb->interactionProfile),
+           profile_index(sb->interactionProfile) < 0 ? " (unknown profile: used like Touch if nothing better is suggested)" : "");
     return XR_SUCCESS;
+}
+/// XR_EXT_hand_interaction: a hand that put its controller down switches to the hand-interaction profile (if suggested).
+static void update_hand_profiles(Session *s, int notify) {
+    int changed = 0;
+    for (int h = 0; h < 2; h++) {
+        int hi = s->handProfile && (!s->profile || hand_tracked(h));
+        changed |= hi != s->handHi[h]; s->handHi[h] = hi;
+    }
+    if (changed && notify) ((XrEventDataInteractionProfileChanged *)new_event(XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED))->session = (XrSession)s;
 }
 static XrResult XRAPI_CALL xrAttachSessionActionSets_(XrSession h, const XrSessionActionSetsAttachInfo *ai) {
     Session *s = (Session *)h; (void)ai;
-    XrPath touch = intern("/interaction_profiles/oculus/touch_controller");
-    XrPath touchPlus = intern("/interaction_profiles/meta/touch_controller_plus");
-    XrPath touchPro = intern("/interaction_profiles/meta/touch_pro_controller");
-    XrPath index = intern("/interaction_profiles/valve/index_controller");
-    XrPath simple = intern("/interaction_profiles/khr/simple_controller");
-
-    XrPath best = XR_NULL_PATH;
+    int best = NPROF + 1;   // profile table order; unknown profiles after all known controllers
+    s->profile = s->handProfile = XR_NULL_PATH;
     for (int k = 0; k < nsugg; k++) {
-        if (sugg[k].profile == touch) { best = touch; break; }
-        if (sugg[k].profile == touchPlus && (!best || best == simple)) best = touchPlus;
-        if (sugg[k].profile == touchPro && (!best || best == simple)) best = touchPro;
-        if (sugg[k].profile == index && (!best || best == simple)) best = index;
-        if (!best && sugg[k].profile != simple) best = sugg[k].profile;
+        int i = profile_index(sugg[k].profile), rank = i < 0 ? NPROF : i;
+        if (i >= 0 && (profiles[i].flags & P_HAND)) s->handProfile = sugg[k].profile;
+        else if (rank < best) { best = rank; s->profile = sugg[k].profile; }
     }
-    s->profile = best ? best : (nsugg ? sugg[0].profile : touch);
+    for (int k = 0; k < nsugg; k++) sugg[k].action->nb = 0;
+    int nb = 0;
     for (int k = 0; k < nsugg; k++) {
-        Action *a = sugg[k].action;
-        if (sugg[k].profile != s->profile || a->nb >= 16) continue;
-        if (parse_binding(pstr(sugg[k].binding), &a->b[a->nb])) a->nb++;
+        Action *a = sugg[k].action; XrPath p = sugg[k].profile;
+        int hand, out; const char *comp;
+        if ((p != s->profile && p != s->handProfile) || a->nb >= 32 || !parse_binding(pstr(sugg[k].binding), &hand, &comp, &out)) continue;
+        int src = resolve(comp, profile_flags(p), hand, out);
+        if (src == S_NONE) { logonce("%s: nothing on the Quest feeds %s (stays idle)", pstr(p), pstr(sugg[k].binding)); continue; }
+        a->b[a->nb++] = (Binding){sugg[k].binding, (int8_t)hand, (uint8_t)src, p == s->handProfile};
+        nb++;
     }
-    logmsg("attached %d bindings, profile %s", nsugg, pstr(s->profile));
-    if (evTail - evHead >= 64) evHead = evTail - 63;
-    XrEventDataInteractionProfileChanged *e = (XrEventDataInteractionProfileChanged *)&events[evTail++ % 64];
-    memset(e, 0, sizeof(XrEventDataBuffer));
-    e->type = XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED; e->session = h;
+    update_hand_profiles(s, 0);
+    logmsg("attached %d bindings, profile %s, hands %s", nb, s->profile ? pstr(s->profile) : "none", s->handProfile ? pstr(s->handProfile) : "none");
+    ((XrEventDataInteractionProfileChanged *)new_event(XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED))->session = h;
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrGetCurrentInteractionProfile_(XrSession h, XrPath user, XrInteractionProfileState *st) {
     Session *s = (Session *)h;
-    const char *u = pstr(user);
-    st->interactionProfile = !strcmp(u, "/user/hand/left") || !strcmp(u, "/user/hand/right") ? s->profile : XR_NULL_PATH;
+    if (!st) return XR_ERROR_VALIDATION_FAILURE;
+    int hand = user == handPath[0] ? 0 : user == handPath[1] ? 1 : -1;
+    st->interactionProfile = hand < 0 ? XR_NULL_PATH : s->handHi[hand] ? s->handProfile : s->profile;
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrSyncActions_(XrSession h, const XrActionsSyncInfo *si) {
     (void)si; Session *s = (Session *)h;
     read_tracking();
     syncGen++;
+    update_hand_profiles(s, 1);
     return s->focused ? XR_SUCCESS : XR_SESSION_NOT_FOCUSED;
 }
 static int active(Session *s) { return s->focused && !shm->input_blocked; }
@@ -1030,21 +1398,20 @@ static float action_value(Session *s, Action *a, XrPath sub, XrVector2f *v2, int
     if (v2) *v2 = (XrVector2f){0, 0};
     for (int i = 0; i < a->nb; i++) {
         Binding *b = &a->b[i];
-        if (!sub_matches(sub, b->hand)) continue;
+        if (!in_use(s, b) || !sub_matches(sub, b->hand)) continue;
         *bound = 1;
         if (!active(s)) continue;
         const VR4Hand *hh = &track.hand[b->hand];
-        if (v2 && (!strcmp(b->comp, "thumbstick") || !strcmp(b->comp, "trackpad") || !strcmp(b->comp, "joystick") ||
-                   !strcmp(b->comp, "thumbstick/2d") || !strcmp(b->comp, "trackpad/2d") || !strcmp(b->comp, "joystick/2d"))) {
-            if (fabsf(hh->stick_x) + fabsf(hh->stick_y) > fabsf(v2->x) + fabsf(v2->y)) *v2 = (XrVector2f){hh->stick_x, hh->stick_y};
+        if (v2) {
+            if (b->src == S_STICK && fabsf(hh->stick_x) + fabsf(hh->stick_y) > fabsf(v2->x) + fabsf(v2->y)) *v2 = (XrVector2f){hh->stick_x, hh->stick_y};
             continue;
         }
-        float v = comp_value(hh, b->comp);
+        float v = src_value(b->hand, b->src);
         if (fabsf(v) > fabsf(best)) best = v;
     }
     return best;
 }
-static int slot(XrPath sub) { const char *p = pstr(sub); return !strcmp(p, "/user/hand/left") ? 0 : !strcmp(p, "/user/hand/right") ? 1 : 2; }
+static int slot(XrPath sub) { return sub == handPath[0] ? 0 : sub == handPath[1] ? 1 : 2; }
 /// changedSinceLastSync: compares this sync's value with the previous sync's, stable across repeated reads.
 static int changed(Action *a, XrPath sub, float x, float y) {
     ActionHistory *h = &a->hist[slot(sub)];
@@ -1076,42 +1443,56 @@ static XrResult XRAPI_CALL xrGetActionStateVector2f_(XrSession h, const XrAction
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrGetActionStatePose_(XrSession h, const XrActionStateGetInfo *gi, XrActionStatePose *st) {
-    (void)h;
     if (!gi || !st) return XR_ERROR_VALIDATION_FAILURE;
     if (!gi->action) return XR_ERROR_HANDLE_INVALID;
     Action *a = (Action *)gi->action;
     st->isActive = XR_FALSE;
-    for (int i = 0; i < a->nb; i++)
-        if (is_pose_comp(a->b[i].comp) && sub_matches(gi->subactionPath, a->b[i].hand)) {
-            if (track.hand[a->b[i].hand].flags & VR4_HAND_ACTIVE) st->isActive = XR_TRUE;
-        }
+    for (int i = 0; i < a->nb; i++) {
+        Binding *b = &a->b[i];
+        if (IS_POSE(b->src) && in_use((Session *)h, b) && sub_matches(gi->subactionPath, b->hand) && (track.hand[b->hand].flags & VR4_HAND_ACTIVE))
+            st->isActive = XR_TRUE;
+    }
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrEnumerateBoundSourcesForAction_(XrSession h, const XrBoundSourcesForActionEnumerateInfo *ei, uint32_t cap, uint32_t *n, XrPath *out) {
-    (void)h;
     if (!ei || (!out && cap > 0)) return XR_ERROR_VALIDATION_FAILURE;
     if (!ei->action) return XR_ERROR_HANDLE_INVALID;
     Action *a = (Action *)ei->action;
-    char buf[160];
-    FILL_ARRAY(cap, n, out, (uint32_t)a->nb, {
-        snprintf(buf, sizeof buf, "/user/hand/%s/input/%s", a->b[i_].hand ? "right" : "left", a->b[i_].comp);
-        out[i_] = intern(buf); });
+    XrPath src[32]; uint32_t ns = 0;
+    for (int i = 0; i < a->nb; i++) if (in_use((Session *)h, &a->b[i])) src[ns++] = a->b[i].path;
+    FILL_ARRAY(cap, n, out, ns, out[i_] = src[i_]);
     return XR_SUCCESS;
 }
+/// Names the physical Quest control a source is fed from ("Left Hand Touch Controller X Button" for an Index left "a").
 static XrResult XRAPI_CALL xrGetInputSourceLocalizedName_(XrSession h, const XrInputSourceLocalizedNameGetInfo *gi, uint32_t cap, uint32_t *n, char *buf) {
-    (void)h;
-    const char *s = pstr(gi->sourcePath); uint32_t len = (uint32_t)strlen(s) + 1;
+    Session *s = (Session *)h;
+    if (!gi || !n || !gi->whichComponents) return XR_ERROR_VALIDATION_FAILURE;
+    int hand, out; const char *comp;
+    if (!parse_binding(pstr(gi->sourcePath), &hand, &comp, &out)) return XR_ERROR_PATH_UNSUPPORTED;
+    static const char *const names[] = {[S_TRIGGER] = "Trigger", [S_TRIGGER_CLICK] = "Trigger", [S_TRIGGER_TOUCH] = "Trigger Touch",
+        [S_SQUEEZE] = "Grip", [S_SQUEEZE_CLICK] = "Grip", [S_STICK] = "Thumbstick", [S_STICK_X] = "Thumbstick", [S_STICK_Y] = "Thumbstick",
+        [S_STICK_CLICK] = "Thumbstick Click", [S_STICK_TOUCH] = "Thumbstick Touch", [S_THUMB_TOUCH] = "Thumb Rest", [S_THUMB_NEAR] = "Thumb Proximity",
+        [S_MENU] = "Menu Button", [S_SYSTEM] = "Menu Button", [S_PAD_CLICK] = "Thumbstick Click", [S_PINCH_READY] = "Pinch Ready",
+        [S_GRASP] = "Grasp", [S_GRASP_READY] = "Grasp Ready", [S_HAPTIC] = "Haptics", [S_AIM] = "Aim", [S_GRIP] = "Grip",
+        [S_PINCH_POSE] = "Pinch", [S_POKE_POSE] = "Index Fingertip", [S_POKE_POSE + 1] = NULL};
+    int hi = s->handHi[hand], src = resolve(comp, profile_flags(hi ? s->handProfile : s->profile), hand, out);
+    const char *part[3] = {gi->whichComponents & XR_INPUT_SOURCE_LOCALIZED_NAME_USER_PATH_BIT ? (hand ? "Right Hand" : "Left Hand") : NULL,
+                           gi->whichComponents & XR_INPUT_SOURCE_LOCALIZED_NAME_INTERACTION_PROFILE_BIT ? (hi ? "Hand Tracking" : "Touch Controller") : NULL,
+                           gi->whichComponents & XR_INPUT_SOURCE_LOCALIZED_NAME_COMPONENT_BIT ?
+                               (src == S_LOWER ? (hand ? "A Button" : "X Button") : src == S_UPPER ? (hand ? "B Button" : "Y Button") : names[src] ? names[src] : comp) : NULL};
+    char name[256] = "";
+    for (int i = 0; i < 3; i++) if (part[i]) snprintf(name + strlen(name), sizeof name - strlen(name), "%s%s", *name ? " " : "", part[i]);
+    uint32_t len = (uint32_t)strlen(name) + 1;
     *n = len;
     if (!cap) return XR_SUCCESS;
     if (cap < len) return XR_ERROR_SIZE_INSUFFICIENT;
-    memcpy(buf, s, len); return XR_SUCCESS;
+    memcpy(buf, name, len); return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrApplyHapticFeedback_(XrSession h, const XrHapticActionInfo *hi, const XrHapticBaseHeader *hb) {
-    (void)h;
     if (hb->type != XR_TYPE_HAPTIC_VIBRATION) return XR_SUCCESS;
     const XrHapticVibration *v = (const XrHapticVibration *)hb;
     Action *a = (Action *)hi->action;
-    for (int i = 0; i < a->nb; i++) if (sub_matches(hi->subactionPath, a->b[i].hand)) {
+    for (int i = 0; i < a->nb; i++) if (a->b[i].src == S_HAPTIC && in_use((Session *)h, &a->b[i]) && sub_matches(hi->subactionPath, a->b[i].hand)) {
         float dur = v->duration <= 0 ? 0.02f : (float)v->duration / 1e9f;
         shm->haptic = (VR4Haptics){(uint8_t)a->b[i].hand, v->amplitude, dur, v->frequency > 0 ? v->frequency : 0};
         vr4_fence(); shm->haptic_seq++;
@@ -1119,11 +1500,94 @@ static XrResult XRAPI_CALL xrApplyHapticFeedback_(XrSession h, const XrHapticAct
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrStopHapticFeedback_(XrSession h, const XrHapticActionInfo *hi) {
-    (void)h;
     Action *a = (Action *)hi->action;
-    for (int i = 0; i < a->nb; i++) if (sub_matches(hi->subactionPath, a->b[i].hand)) {
+    for (int i = 0; i < a->nb; i++) if (a->b[i].src == S_HAPTIC && in_use((Session *)h, &a->b[i]) && sub_matches(hi->subactionPath, a->b[i].hand)) {
         shm->haptic = (VR4Haptics){(uint8_t)a->b[i].hand, 0.0f, 0.0f, 0.0f};
         vr4_fence(); shm->haptic_seq++;
+    }
+    return XR_SUCCESS;
+}
+
+// ---------------------------------------------------------------- hand tracking
+// XR_EXT_hand_tracking from the Quest's own 26 joints (shm hand_joints), with velocities from consecutive samples,
+// typical joint radii, XR_FB_hand_tracking_aim (the Mac's shoulder-to-pinch ray, pinch strengths) and
+// XR_EXT_hand_tracking_data_source (always unobstructed: a hand holding a controller reports inactive).
+static const float jointRadius[XR_HAND_JOINT_COUNT_EXT] = {0.022f, 0.020f,   // palm, wrist
+    0.019f, 0.012f, 0.010f, 0.009f, 0.021f, 0.011f, 0.009f, 0.008f, 0.007f, 0.021f, 0.011f, 0.009f, 0.008f, 0.007f,   // thumb, index, middle
+    0.019f, 0.010f, 0.008f, 0.007f, 0.006f, 0.017f, 0.009f, 0.007f, 0.006f, 0.005f};                                  // ring, little
+static XrResult XRAPI_CALL xrCreateHandTrackerEXT_(XrSession h, const XrHandTrackerCreateInfoEXT *ci, XrHandTrackerEXT *out) {
+    (void)h;
+    if (!ci || !out || (ci->hand != XR_HAND_LEFT_EXT && ci->hand != XR_HAND_RIGHT_EXT)) return XR_ERROR_VALIDATION_FAILURE;
+    if (ci->handJointSet != XR_HAND_JOINT_SET_DEFAULT_EXT) { logonce("hand joint set %d unsupported", ci->handJointSet); return XR_ERROR_VALIDATION_FAILURE; }
+    int unobstructed = 1;
+    for (const XrBaseInStructure *n = ci->next; n; n = n->next)
+        if (n->type == XR_TYPE_HAND_TRACKING_DATA_SOURCE_INFO_EXT) {
+            const XrHandTrackingDataSourceInfoEXT *d = (const XrHandTrackingDataSourceInfoEXT *)n;
+            if (!d->requestedDataSourceCount) return XR_ERROR_VALIDATION_FAILURE;
+            unobstructed = 0;
+            for (uint32_t i = 0; i < d->requestedDataSourceCount; i++) unobstructed |= d->requestedDataSources[i] == XR_HAND_TRACKING_DATA_SOURCE_UNOBSTRUCTED_EXT;
+        }
+    HandTracker *t = calloc(1, sizeof *t);
+    t->hand = ci->hand == XR_HAND_RIGHT_EXT; t->unobstructed = unobstructed;
+    *out = (XrHandTrackerEXT)t;
+    return XR_SUCCESS;
+}
+static XrResult XRAPI_CALL xrDestroyHandTrackerEXT_(XrHandTrackerEXT t) { free(t); return XR_SUCCESS; }
+static XrResult XRAPI_CALL xrLocateHandJointsEXT_(XrHandTrackerEXT ht, const XrHandJointsLocateInfoEXT *li, XrHandJointLocationsEXT *locs) {
+    HandTracker *t = (HandTracker *)ht;
+    if (!t || !li || !li->baseSpace) return XR_ERROR_HANDLE_INVALID;
+    if (!locs || locs->jointCount != XR_HAND_JOINT_COUNT_EXT || !locs->jointLocations) return XR_ERROR_VALIDATION_FAILURE;
+    XrHandJointVelocitiesEXT *vel = NULL; XrHandTrackingAimStateFB *aim = NULL; XrHandTrackingDataSourceStateEXT *src = NULL;
+    for (XrBaseOutStructure *n = locs->next; n; n = n->next) {
+        if (n->type == XR_TYPE_HAND_JOINT_VELOCITIES_EXT) vel = (XrHandJointVelocitiesEXT *)n;
+        if (n->type == XR_TYPE_HAND_TRACKING_AIM_STATE_FB) aim = (XrHandTrackingAimStateFB *)n;
+        if (n->type == XR_TYPE_HAND_TRACKING_DATA_SOURCE_STATE_EXT) src = (XrHandTrackingDataSourceStateEXT *)n;
+    }
+    if (vel && (vel->jointCount != XR_HAND_JOINT_COUNT_EXT || !vel->jointVelocities)) return XR_ERROR_VALIDATION_FAILURE;
+    int h = t->hand, bv;
+    XrPosef base = space_in_stage((Space *)li->baseSpace, &bv), inv = pinv(base);
+    int on = t->unobstructed && hand_tracked(h) && bv && theSession && active(theSession);
+    float ws = current_world_scale(), dt = (float)(jointsNs - prevJointsNs) * 1e-9f;
+    int velOk = on && prevJoints[h].tracked && dt > 0.002f && dt < 0.15f;
+    locs->isActive = on;
+    for (int i = 0; i < XR_HAND_JOINT_COUNT_EXT; i++) {
+        XrHandJointLocationEXT *L = &locs->jointLocations[i];
+        XrPosef p = xp(joints[h].joint[i]);
+        L->locationFlags = on ? XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT |
+                                XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT : 0;
+        L->pose = on ? pmul(inv, p) : IDENT;
+        L->radius = on ? jointRadius[i] / ws : 0;
+        if (!vel) continue;
+        XrHandJointVelocityEXT *jv = &vel->jointVelocities[i];
+        *jv = (XrHandJointVelocityEXT){0};
+        if (!velOk) continue;
+        V lin, ang; pose_velocity(xp(prevJoints[h].joint[i]), p, dt, &lin, &ang);
+        jv->linearVelocity = qrot(inv.orientation, lin); jv->angularVelocity = qrot(inv.orientation, ang);
+        jv->velocityFlags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
+    }
+    if (src) { src->isActive = on; src->dataSource = XR_HAND_TRACKING_DATA_SOURCE_UNOBSTRUCTED_EXT; }
+    if (aim) {
+        const VR4Hand *vh = &track.hand[h];
+        aim->status = 0; aim->aimPose = IDENT;
+        aim->pinchStrengthIndex = aim->pinchStrengthMiddle = aim->pinchStrengthRing = aim->pinchStrengthLittle = 0;
+        if (on) {
+            const VR4Pose *palm = &joints[h].joint[XR_HAND_JOINT_PALM_EXT];
+            V toHead = {track.head.px - palm->px, track.head.py - palm->py, track.head.pz - palm->pz};
+            V normal = qrot((Q){palm->qx, palm->qy, palm->qz, palm->qw}, (V){0, -1, 0});   // palm normal is -Y
+            float facing = vlen(toHead) > 0 ? (normal.x * toHead.x + normal.y * toHead.y + normal.z * toHead.z) / vlen(toHead) : 0;
+            int pinched = vh->trigger > 0.5f;   // the Mac's pinch (with hysteresis) is the trigger
+            aim->pinchStrengthIndex = pinched ? 1 : pinch_strength(h, XR_HAND_JOINT_INDEX_TIP_EXT);
+            aim->pinchStrengthMiddle = pinch_strength(h, XR_HAND_JOINT_MIDDLE_TIP_EXT);
+            aim->pinchStrengthRing = pinch_strength(h, XR_HAND_JOINT_RING_TIP_EXT);
+            aim->pinchStrengthLittle = pinch_strength(h, XR_HAND_JOINT_LITTLE_TIP_EXT);
+            aim->status = XR_HAND_TRACKING_AIM_COMPUTED_BIT_FB | (facing > 0.6f ? XR_HAND_TRACKING_AIM_SYSTEM_GESTURE_BIT_FB : XR_HAND_TRACKING_AIM_VALID_BIT_FB) |
+                          (pinched ? XR_HAND_TRACKING_AIM_INDEX_PINCHING_BIT_FB : 0) |
+                          (aim->pinchStrengthMiddle >= 1 ? XR_HAND_TRACKING_AIM_MIDDLE_PINCHING_BIT_FB : 0) |
+                          (aim->pinchStrengthRing >= 1 ? XR_HAND_TRACKING_AIM_RING_PINCHING_BIT_FB : 0) |
+                          (aim->pinchStrengthLittle >= 1 ? XR_HAND_TRACKING_AIM_LITTLE_PINCHING_BIT_FB : 0) |
+                          (h ? XR_HAND_TRACKING_AIM_DOMINANT_HAND_BIT_FB : 0) | (vh->buttons & VR4_BTN_MENU ? XR_HAND_TRACKING_AIM_MENU_PRESSED_BIT_FB : 0);
+            aim->aimPose = pmul(inv, xp(vh->aim));
+        }
     }
     return XR_SUCCESS;
 }
@@ -1137,9 +1601,21 @@ static XrResult XRAPI_CALL xrGetDisplayRefreshRateFB_(XrSession h, float *rate) 
 static XrResult XRAPI_CALL xrRequestDisplayRefreshRateFB_(XrSession h, float rate) {
     (void)h; return rate == 0 || fabsf(rate - current_hz()) < 0.5f ? XR_SUCCESS : XR_ERROR_DISPLAY_REFRESH_RATE_UNSUPPORTED_FB;
 }
+/// Nothing is hidden: the hidden mesh is empty and the visible mesh / outline cover the whole view (tangent space).
 static XrResult XRAPI_CALL xrGetVisibilityMaskKHR_(XrSession h, XrViewConfigurationType t, uint32_t view, XrVisibilityMaskTypeKHR mt, XrVisibilityMaskKHR *m) {
-    (void)h; (void)t; (void)view; (void)mt;   // no hidden-area mask: the whole eye buffer is visible
-    m->vertexCountOutput = 0; m->indexCountOutput = 0; return XR_SUCCESS;
+    (void)h;
+    if (t != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+    if (view > 1 || !m) return XR_ERROR_VALIDATION_FAILURE;
+    const VR4Fov *f = &frame_for(0)->eye[view].fov;
+    XrVector2f v[4] = {{tanf(f->left), tanf(f->down)}, {tanf(f->right), tanf(f->down)}, {tanf(f->right), tanf(f->up)}, {tanf(f->left), tanf(f->up)}};
+    static const uint32_t tri[6] = {0, 1, 2, 0, 2, 3}, loop[4] = {0, 1, 2, 3};   // counter-clockwise
+    int hidden = mt == XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR, line = mt == XR_VISIBILITY_MASK_TYPE_LINE_LOOP_KHR;
+    uint32_t nv = hidden ? 0 : 4, ni = hidden ? 0 : line ? 4 : 6;
+    m->vertexCountOutput = nv; m->indexCountOutput = ni;
+    if (!m->vertexCapacityInput && !m->indexCapacityInput) return XR_SUCCESS;
+    if (m->vertexCapacityInput < nv || m->indexCapacityInput < ni) return XR_ERROR_SIZE_INSUFFICIENT;
+    memcpy(m->vertices, v, nv * sizeof *v); memcpy(m->indices, line ? loop : tri, ni * sizeof *tri);
+    return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrEnumerateColorSpacesFB_(XrSession h, uint32_t cap, uint32_t *n, XrColorSpaceFB *cs) {
     (void)h;
@@ -1150,6 +1626,12 @@ static XrResult XRAPI_CALL xrEnumerateColorSpacesFB_(XrSession h, uint32_t cap, 
 static XrResult XRAPI_CALL xrSetColorSpaceFB_(XrSession h, const XrColorSpaceFB cs) {
     (void)h;
     if (cs < XR_COLOR_SPACE_UNMANAGED_FB || cs > XR_COLOR_SPACE_ADOBE_RGB_FB) return XR_ERROR_COLOR_SPACE_UNSUPPORTED_FB;
+    return XR_SUCCESS;
+}
+static XrResult XRAPI_CALL xrPerfSettingsSetPerformanceLevelEXT_(XrSession h, XrPerfSettingsDomainEXT d, XrPerfSettingsLevelEXT l) {
+    (void)h;   // a hint: the Mac's GPU and the headset's clocks aren't ours to set
+    if (d != XR_PERF_SETTINGS_DOMAIN_CPU_EXT && d != XR_PERF_SETTINGS_DOMAIN_GPU_EXT) return XR_ERROR_VALIDATION_FAILURE;
+    logonce("performance level %d requested for %s (hint only)", l, d == XR_PERF_SETTINGS_DOMAIN_CPU_EXT ? "CPU" : "GPU");
     return XR_SUCCESS;
 }
 
@@ -1170,28 +1652,31 @@ static const struct { const char *name; PFN_xrVoidFunction fn; } table[] = {
     F(xrDestroyInstance) F(xrGetInstanceProperties) F(xrPollEvent) F(xrResultToString) F(xrStructureTypeToString)
     F(xrStringToPath) F(xrPathToString) F(xrGetSystem) F(xrGetSystemProperties) F(xrEnumerateEnvironmentBlendModes)
     F(xrEnumerateViewConfigurations) F(xrGetViewConfigurationProperties) F(xrEnumerateViewConfigurationViews)
-    F(xrGetD3D11GraphicsRequirementsKHR) F(xrConvertWin32PerformanceCounterToTimeKHR) F(xrConvertTimeToWin32PerformanceCounterKHR)
+    F(xrGetD3D11GraphicsRequirementsKHR) F(xrGetD3D12GraphicsRequirementsKHR) F(xrConvertWin32PerformanceCounterToTimeKHR) F(xrConvertTimeToWin32PerformanceCounterKHR)
     F(xrCreateSession) F(xrDestroySession) F(xrBeginSession) F(xrEndSession) F(xrRequestExitSession)
     F(xrEnumerateReferenceSpaces) F(xrCreateReferenceSpace) F(xrGetReferenceSpaceBoundsRect) F(xrCreateActionSpace)
-    F(xrLocateSpace) F(xrDestroySpace) F(xrWaitFrame) F(xrBeginFrame) F(xrEndFrame) F(xrLocateViews)
+    F(xrLocateSpace) F(xrLocateSpaces) F(xrDestroySpace) F(xrWaitFrame) F(xrBeginFrame) F(xrEndFrame) F(xrLocateViews)
     F(xrEnumerateSwapchainFormats) F(xrCreateSwapchain) F(xrDestroySwapchain) F(xrEnumerateSwapchainImages)
     F(xrAcquireSwapchainImage) F(xrWaitSwapchainImage) F(xrReleaseSwapchainImage)
     F(xrCreateActionSet) F(xrDestroyActionSet) F(xrCreateAction) F(xrDestroyAction) F(xrSuggestInteractionProfileBindings)
     F(xrAttachSessionActionSets) F(xrGetCurrentInteractionProfile) F(xrSyncActions) F(xrGetActionStateBoolean)
     F(xrGetActionStateFloat) F(xrGetActionStateVector2f) F(xrGetActionStatePose) F(xrEnumerateBoundSourcesForAction)
     F(xrGetInputSourceLocalizedName) F(xrApplyHapticFeedback) F(xrStopHapticFeedback)
+    F(xrCreateHandTrackerEXT) F(xrDestroyHandTrackerEXT) F(xrLocateHandJointsEXT)
     F(xrEnumerateDisplayRefreshRatesFB) F(xrGetDisplayRefreshRateFB) F(xrRequestDisplayRefreshRateFB) F(xrGetVisibilityMaskKHR)
-    F(xrEnumerateColorSpacesFB) F(xrSetColorSpaceFB)
+    F(xrEnumerateColorSpacesFB) F(xrSetColorSpaceFB) F(xrPerfSettingsSetPerformanceLevelEXT)
     F(xrSetDebugUtilsObjectNameEXT) F(xrCreateDebugUtilsMessengerEXT) F(xrDestroyDebugUtilsMessengerEXT)
     F(xrSessionBeginDebugUtilsLabelRegionEXT) F(xrSessionEndDebugUtilsLabelRegionEXT) F(xrSessionInsertDebugUtilsLabelEXT)
 #undef F
+    {"xrLocateSpacesKHR", (PFN_xrVoidFunction)xrLocateSpaces_},
 };
 static XrResult XRAPI_CALL xrGetInstanceProcAddr_(XrInstance inst, const char *name, PFN_xrVoidFunction *fn) {
     (void)inst;
+    if (!name || !fn) return XR_ERROR_VALIDATION_FAILURE;
     for (size_t i = 0; i < sizeof table / sizeof table[0]; i++)
         if (!strcmp(name, table[i].name)) { *fn = table[i].fn; return XR_SUCCESS; }
     *fn = NULL;
-    logmsg("unsupported function %s", name);
+    logonce("unsupported function %s (the game may lose that feature)", name);
     return XR_ERROR_FUNCTION_UNSUPPORTED;
 }
 
