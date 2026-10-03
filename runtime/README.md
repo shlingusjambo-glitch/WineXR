@@ -62,6 +62,8 @@ Valve Index, HP Reverb G2, Vive Cosmos, Windows Mixed Reality, HTC Vive, KHR
 simple; unknown profiles come last and are read like Touch. Remaps:
 
 - `a`/`b` on the left hand are X/Y; `x`/`y` on the right hand are A/B.
+- Thumbstick `x`/`y` components bound separately feed one vector2f action
+  (the usual stick binding); a whole-`thumbstick` binding works too.
 - A Vive trackpad is the thumbstick (click = stick click or A/X); a trackpad
   next to a real stick (Index, WMR) stays idle, except WMR's pad click = A/X.
 - `menu` on the right hand of a controller without face buttons (Vive,

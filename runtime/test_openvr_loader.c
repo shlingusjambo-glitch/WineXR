@@ -12,10 +12,11 @@ typedef void *(__cdecl *Interface)(const char *, int *);
 typedef const char *(__cdecl *ErrorText)(int);
 typedef void (__cdecl *TargetSize)(uint32_t *, uint32_t *);
 int main(int argc, char **argv) {
-    freopen("C:\\VR4Mac\\loader-probe.txt", "w", stdout);
+    if(!freopen("C:\\VR4Mac\\loader-probe.txt", "w", stdout))
+        fprintf(stderr,"warning: log redirect failed, using console\n");
     setvbuf(stdout,NULL,_IONBF,0);
     printf("Probe started argc=%d\n",argc);
-    const char *path=argc>1 ? argv[1] : "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Gorilla Tag\\Gorilla Tag_Data\\Plugins\\x86_64\\openvr_api.dll";
+    const char *path=(argc>1 && argv[1][0]) ? argv[1] : "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Gorilla Tag\\Gorilla Tag_Data\\Plugins\\x86_64\\openvr_api.dll";
     printf("DLL=%s\n",path);
     HMODULE dll=LoadLibraryA(path);
     if(!dll && argc == 1) {
@@ -72,5 +73,6 @@ int main(int argc, char **argv) {
     }
     stop(); FreeLibrary(dll);
     if(!result) puts("PASS real OpenVR loader + system interface. Confirm custom runtime log and perform rendering/input/audio tests separately.");
+    fflush(stdout);
     return result;
 }

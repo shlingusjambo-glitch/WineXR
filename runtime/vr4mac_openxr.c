@@ -90,6 +90,7 @@ static VR4Pose raw_pose(XrPosef p) {   // app units -> raw stage metres
 static const XrPosef IDENT = {{0, 0, 0, 1}, {0, 0, 0}};
 /// Finite-difference velocity a -> b over dt seconds (clamped against tracking glitches).
 static void pose_velocity(XrPosef a, XrPosef b, float dt, V *lin, V *ang) {
+    if (!(dt > 0)) { *lin = (V){0, 0, 0}; *ang = (V){0, 0, 0}; return; }
     *lin = vscale(vsub(b.position, a.position), 1 / dt);
     Q r = qmul(b.orientation, qconj(a.orientation));
     if (r.w < 0) r = (Q){-r.x, -r.y, -r.z, -r.w};
@@ -502,6 +503,7 @@ static XrResult XRAPI_CALL xrEnumerateInstanceExtensionProperties_(const char *l
 }
 
 static XrResult XRAPI_CALL xrCreateInstance_(const XrInstanceCreateInfo *ci, XrInstance *out) {
+    if (!ci || !out) return XR_ERROR_VALIDATION_FAILURE;
     char req[1024] = "";
     for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) {
         int ok = 0;
@@ -528,10 +530,11 @@ static XrResult XRAPI_CALL xrCreateInstance_(const XrInstanceCreateInfo *ci, XrI
 }
 static XrResult XRAPI_CALL xrDestroyInstance_(XrInstance i) { (void)i; nsugg = 0; return XR_SUCCESS; }   // suggestions are per instance
 static XrResult XRAPI_CALL xrGetInstanceProperties_(XrInstance i, XrInstanceProperties *p) {
-    (void)i; p->runtimeVersion = XR_MAKE_VERSION(1, 1, 0); strcpy(p->runtimeName, "VR4Mac"); return XR_SUCCESS;
+    (void)i; p->runtimeVersion = XR_MAKE_VERSION(1, 1, 1); strcpy(p->runtimeName, "VR4Mac"); return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrPollEvent_(XrInstance i, XrEventDataBuffer *e) {
     (void)i;
+    if (!e) return XR_ERROR_VALIDATION_FAILURE;
     Session *s = theSession;
     if (s && s->running && !s->exitRequested) {   // dashboard open on the Mac side = app loses input focus
         int focused = !shm->input_blocked;
@@ -555,9 +558,13 @@ static XrResult XRAPI_CALL xrStructureTypeToString_(XrInstance i, XrStructureTyp
     #undef RS
     return XR_SUCCESS;
 }
-static XrResult XRAPI_CALL xrStringToPath_(XrInstance i, const char *s, XrPath *p) { (void)i; *p = intern(s); return *p ? XR_SUCCESS : XR_ERROR_PATH_COUNT_EXCEEDED; }
+static XrResult XRAPI_CALL xrStringToPath_(XrInstance i, const char *s, XrPath *p) {
+    (void)i; if (!s || !p) return XR_ERROR_VALIDATION_FAILURE;
+    *p = intern(s); return *p ? XR_SUCCESS : XR_ERROR_PATH_COUNT_EXCEEDED;
+}
 static XrResult XRAPI_CALL xrPathToString_(XrInstance i, XrPath p, uint32_t cap, uint32_t *n, char *buf) {
     (void)i;
+    if (!n) return XR_ERROR_VALIDATION_FAILURE;
     if (p < 1 || p > (XrPath)npaths) return XR_ERROR_PATH_INVALID;
     const char *s = pstr(p); uint32_t len = (uint32_t)strlen(s) + 1;
     *n = len;
@@ -570,11 +577,13 @@ static XrResult XRAPI_CALL xrPathToString_(XrInstance i, XrPath p, uint32_t cap,
 // ---------------------------------------------------------------- system
 static XrResult XRAPI_CALL xrGetSystem_(XrInstance i, const XrSystemGetInfo *gi, XrSystemId *id) {
     (void)i;
+    if (!gi || !id) return XR_ERROR_VALIDATION_FAILURE;
     if (gi->formFactor != XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY) return XR_ERROR_FORM_FACTOR_UNSUPPORTED;
     *id = 1; return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrGetSystemProperties_(XrInstance i, XrSystemId id, XrSystemProperties *p) {
     (void)i; (void)id;
+    if (!p) return XR_ERROR_VALIDATION_FAILURE;
     p->systemId = 1; p->vendorId = 0x2833;
     strcpy(p->systemName, "VR4Mac Quest");
     p->graphicsProperties.maxSwapchainImageWidth = 4096; p->graphicsProperties.maxSwapchainImageHeight = 4096;
@@ -647,6 +656,7 @@ static XrResult XRAPI_CALL xrConvertTimeToWin32PerformanceCounterKHR_(XrInstance
 // ---------------------------------------------------------------- session
 static XrResult XRAPI_CALL xrCreateSession_(XrInstance i, const XrSessionCreateInfo *ci, XrSession *out) {
     (void)i;
+    if (!ci || !out) return XR_ERROR_VALIDATION_FAILURE;
     const XrGraphicsBindingD3D11KHR *gb = NULL; const XrGraphicsBindingD3D12KHR *gb12 = NULL;
     for (const XrBaseInStructure *b = ci->next; b; b = b->next) {
         if (b->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) gb = (const XrGraphicsBindingD3D11KHR *)b;
@@ -1124,7 +1134,9 @@ static XrResult XRAPI_CALL xrEndFrame_(XrSession h, const XrFrameEndInfo *fi) {
 }
 static XrResult XRAPI_CALL xrEndFrameImpl(XrSession h, const XrFrameEndInfo *fi) {
     Session *s = (Session *)h;
-    if (!s || !fi) return XR_ERROR_HANDLE_INVALID;
+    if (!s) return XR_ERROR_HANDLE_INVALID;
+    if (!fi) return XR_ERROR_VALIDATION_FAILURE;
+    shm->runtime_heartbeat_ns = (uint64_t)qpc_ns();   // every EndFrame, even layer-less ones (loading screens)
     if (fi->displayTime && (uint64_t)fi->displayTime == s->lastPublished) {
         shm->runtime_heartbeat_ns = (uint64_t)qpc_ns();   // same frame re-submitted: no new pixels, stay alive
         return XR_SUCCESS;
@@ -1262,7 +1274,7 @@ static XrResult XRAPI_CALL xrCreateSwapchain_(XrSession h, const XrSwapchainCrea
            ci->arraySize, ci->mipCount, ci->faceCount, (unsigned long long)ci->usageFlags, (unsigned long long)ci->createFlags);
     Swapchain *sc = calloc(1, sizeof *sc);
     sc->fmt = typeless((DXGI_FORMAT)ci->format); sc->w = ci->width; sc->h = ci->height; sc->array = ci->arraySize ? ci->arraySize : 1;
-    sc->mips = ci->mipCount ? ci->mipCount : 1; sc->released = -1;
+    sc->mips = ci->mipCount ? ci->mipCount : 1; sc->acquired = sc->released = -1;
     sc->count = ci->createFlags & XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT ? 1 : 3;
     if (s->dev12) {   // handed out in the states XR_KHR_D3D12_enable promises: RENDER_TARGET / DEPTH_WRITE
         int color = is_color(sc->fmt);
@@ -1402,8 +1414,13 @@ static float action_value(Session *s, Action *a, XrPath sub, XrVector2f *v2, int
         *bound = 1;
         if (!active(s)) continue;
         const VR4Hand *hh = &track.hand[b->hand];
-        if (v2) {
-            if (b->src == S_STICK && fabsf(hh->stick_x) + fabsf(hh->stick_y) > fabsf(v2->x) + fabsf(v2->y)) *v2 = (XrVector2f){hh->stick_x, hh->stick_y};
+        if (v2) {   // games usually bind the x/y components separately to one vector2f action
+            float cx = v2->x, cy = v2->y;
+            if (b->src == S_STICK) { cx = hh->stick_x; cy = hh->stick_y; }
+            else if (b->src == S_STICK_X) cx = hh->stick_x;
+            else if (b->src == S_STICK_Y) cy = hh->stick_y;
+            else continue;
+            if (fabsf(cx) + fabsf(cy) > fabsf(v2->x) + fabsf(v2->y)) *v2 = (XrVector2f){cx, cy};
             continue;
         }
         float v = src_value(b->hand, b->src);
@@ -1606,6 +1623,8 @@ static XrResult XRAPI_CALL xrGetVisibilityMaskKHR_(XrSession h, XrViewConfigurat
     (void)h;
     if (t != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
     if (view > 1 || !m) return XR_ERROR_VALIDATION_FAILURE;
+    if (mt != XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR && mt != XR_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH_KHR &&
+        mt != XR_VISIBILITY_MASK_TYPE_LINE_LOOP_KHR) return XR_ERROR_VALIDATION_FAILURE;
     const VR4Fov *f = &frame_for(0)->eye[view].fov;
     XrVector2f v[4] = {{tanf(f->left), tanf(f->down)}, {tanf(f->right), tanf(f->down)}, {tanf(f->right), tanf(f->up)}, {tanf(f->left), tanf(f->up)}};
     static const uint32_t tri[6] = {0, 1, 2, 0, 2, 3}, loop[4] = {0, 1, 2, 3};   // counter-clockwise
@@ -1625,7 +1644,8 @@ static XrResult XRAPI_CALL xrEnumerateColorSpacesFB_(XrSession h, uint32_t cap, 
 }
 static XrResult XRAPI_CALL xrSetColorSpaceFB_(XrSession h, const XrColorSpaceFB cs) {
     (void)h;
-    if (cs < XR_COLOR_SPACE_UNMANAGED_FB || cs > XR_COLOR_SPACE_ADOBE_RGB_FB) return XR_ERROR_COLOR_SPACE_UNSUPPORTED_FB;
+    if (cs != XR_COLOR_SPACE_QUEST_FB && cs != XR_COLOR_SPACE_REC709_FB && cs != XR_COLOR_SPACE_UNMANAGED_FB)
+        return XR_ERROR_COLOR_SPACE_UNSUPPORTED_FB;
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL xrPerfSettingsSetPerformanceLevelEXT_(XrSession h, XrPerfSettingsDomainEXT d, XrPerfSettingsLevelEXT l) {

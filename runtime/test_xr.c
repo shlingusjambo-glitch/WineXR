@@ -10,6 +10,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #define XR_NO_PROTOTYPES
 #define XR_USE_PLATFORM_WIN32
 #define XR_USE_GRAPHICS_API_D3D11
@@ -92,19 +93,20 @@ static XrTime frame(const XrCompositionLayerBaseHeader *const *layers, uint32_t 
     CHECK(xrEndFrame(ses, &fe));
     return fe.displayTime;
 }
-static XrCompositionLayerProjectionView pviews[2];
-static XrCompositionLayerProjection projection(Chain *c, XrSpace space) {   // both eyes side by side in one swapchain
+static XrCompositionLayerProjectionView pviews[2], pviewsArr[2], pviews12[2];
+static XrCompositionLayerProjection projection_into(Chain *c, XrSpace space, XrCompositionLayerProjectionView out[2]) {   // both eyes side by side in one swapchain
     XrView v[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}; uint32_t n;
     XrViewState vs = {XR_TYPE_VIEW_STATE};
     XrViewLocateInfo li = {XR_TYPE_VIEW_LOCATE_INFO, NULL, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, space};
     CHECK(xrLocateViews(ses, &li, &vs, 2, &n, v));
     for (int e = 0; e < 2; e++) {
         XrCompositionLayerProjectionView pv = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW, NULL, v[e].pose, v[e].fov, {c->sc, {{(int32_t)(e * w), 0}, {(int32_t)w, (int32_t)h}}, 0}};
-        pviews[e] = pv;
+        out[e] = pv;
     }
-    XrCompositionLayerProjection p = {XR_TYPE_COMPOSITION_LAYER_PROJECTION, NULL, 0, space, 2, pviews};
+    XrCompositionLayerProjection p = {XR_TYPE_COMPOSITION_LAYER_PROJECTION, NULL, 0, space, 2, out};
     return p;
 }
+static XrCompositionLayerProjection projection(Chain *c, XrSpace space) { return projection_into(c, space, pviews); }
 static const uint32_t *pixels(void) { return (const uint32_t *)vr4_frame(shm, shm->frame_seq); }
 typedef struct { uint32_t x, y, v; } Probe;   // pixel of the side-by-side frame
 /// Submits frames until a published frame matches every probe (readback is asynchronous, up to 4 frames behind).
@@ -199,9 +201,12 @@ static void start(const char *name, const void *binding) {   // instance + sessi
 int main(int argc, char **argv) {
     // Sikarugir engine wine disconnects console stdout: VR4_TEST_LOG=C:\path\file redirects it.
     const char *logf = getenv("VR4_TEST_LOG");
-    if (logf) freopen(logf, "w", stdout);
+    if (logf && !freopen(logf, "w", stdout)) fprintf(stderr, "warning: log redirect %s failed\n", logf);
     int frames = argc > 1 ? atoi(argv[1]) : 10;
-    char shmPath[MAX_PATH]; GetTempPathA(MAX_PATH, shmPath); strcat(shmPath, "vr4test_shm");
+    if (frames < 1) frames = 10;   // garbage argv must not trivially pass the published-count check below
+    char shmPath[MAX_PATH]; DWORD tplen = GetTempPathA(MAX_PATH, shmPath);
+    EXPECT(tplen > 0 && tplen + strlen("vr4test_shm") < MAX_PATH, "temp path len %lu", (unsigned long)tplen);
+    strcat(shmPath, "vr4test_shm");
     HANDLE f = CreateFileA(shmPath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS, 0, NULL);
     shm = MapViewOfFile(CreateFileMappingA(f, NULL, PAGE_READWRITE, 0, VR4_SHM_SIZE, NULL), FILE_MAP_ALL_ACCESS, 0, 0, VR4_SHM_SIZE);
     EXPECT(shm, "shm %s", shmPath);
@@ -315,8 +320,8 @@ int main(int argc, char **argv) {
             ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, e ? GREEN : RED); ID3D11RenderTargetView_Release(rtv);
         }
         CHECK(xrReleaseSwapchainImage(arr.sc, NULL));
-        XrCompositionLayerProjection pa = projection(&arr, stage);
-        for (int e = 0; e < 2; e++) { pviews[e].subImage.imageRect.offset.x = 0; pviews[e].subImage.imageArrayIndex = e; }
+        XrCompositionLayerProjection pa = projection_into(&arr, stage, pviewsArr);
+        for (int e = 0; e < 2; e++) { pviewsArr[e].subImage.imageRect.offset.x = 0; pviewsArr[e].subImage.imageArrayIndex = e; }
         const XrCompositionLayerBaseHeader *la[] = {(XrCompositionLayerBaseHeader *)&pa};
         Probe ps[] = {{cl, cy, PX_RED}, {cr, cy, PX_GREEN}};
         expect_frame("array swapchain (single-pass instanced)", la, 1, ps, 2);
@@ -351,8 +356,8 @@ int main(int argc, char **argv) {
     trk.time_ns += 11000000; put_track(&trk, j);
     sync();
     XrPath idxP = path("/interaction_profiles/valve/index_controller"), handP = path("/interaction_profiles/ext/hand_interaction_ext");
-    EXPECT(profile_of("/user/hand/left") == idxP && profile_of("/user/hand/right") == handP, "profiles left %llu right %llu",
-           (unsigned long long)profile_of("/user/hand/left"), (unsigned long long)profile_of("/user/hand/right"));
+    XrPath profL = profile_of("/user/hand/left"), profR = profile_of("/user/hand/right");
+    EXPECT(profL == idxP && profR == handP, "profiles left %llu right %llu", (unsigned long long)profL, (unsigned long long)profR);
     EXPECT(drain_events(XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) == 1, "profile event when the right hand put its controller down");
     XrBool32 act;
     EXPECT(get_bool(jump, "/user/hand/left", &act) && act, "Index left a = X button");
@@ -504,7 +509,7 @@ int main(int argc, char **argv) {
         ID3D12GraphicsCommandList_Close(gl);
         ID3D12CommandQueue_ExecuteCommandLists(q, 1, (ID3D12CommandList *const *)&gl);
         CHECK(xrReleaseSwapchainImage(c12.sc, NULL));
-        XrCompositionLayerProjection p12 = projection(&c12, stage);
+        XrCompositionLayerProjection p12 = projection_into(&c12, stage, pviews12);
         const XrCompositionLayerBaseHeader *l12[] = {(XrCompositionLayerBaseHeader *)&p12};
         Probe pg[] = {{2, 2, PX_GREEN}, {cr, cy, PX_GREEN}};
         expect_frame("D3D12 projection", l12, 1, pg, 2);

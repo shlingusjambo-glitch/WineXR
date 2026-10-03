@@ -33,6 +33,12 @@ mac/Resources/hands/hand.obj: the "Splayed" mesh from "hand topology technical d
 supplied by the project owner; converted to metres and trimmed past the wrist. Rigged and posed at runtime by
 mac/Sources/Hands.swift.
 
+## 3D home models
+
+Room 1107 and Kleeblatt were supplied by the project owner as model archives.
+Credit: [fangzhangmnm](https://sketchfab.com/fangzhangmnm). These assets remain
+their creator’s work and are not covered by MacVR’s MIT license.
+
 ## System frameworks (build/run only)
 
 Xcode command-line tools (Swift, VideoToolbox, ScreenCaptureKit, SceneKit),
